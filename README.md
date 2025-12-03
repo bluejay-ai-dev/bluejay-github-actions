@@ -18,7 +18,7 @@ Add the following step to your `.github/workflows/main.yml` (or similar) file:
 ```yaml
 steps:
   - name: Run Bluejay Simulation
-    uses: bluejay-ai-dev/bluejay-github-actions@main
+    uses: bluejay-ai-dev/bluejay-github-actions@v1.0.0
     with:
       api_key: ${{ secrets.BLUEJAY_API_KEY }}
       simulation_id: "your-simulation-id-here"
@@ -31,7 +31,7 @@ You can customize the simulation run by providing additional parameters like pro
 ```yaml
 steps:
   - name: Run Custom Bluejay Simulation
-    uses: bluejay-ai-dev/bluejay-github-actions@main
+    uses: bluejay-ai-dev/bluejay-github-actions@v1.0.0
     with:
       api_key: ${{ secrets.BLUEJAY_API_KEY }}
       simulation_id: "your-simulation-id"
