@@ -94,6 +94,17 @@ jobs:
           git config user.email "bluebic@getbluejay.ai"
           git checkout -b "bluebic/${{ github.event.inputs.chat_id }}-${{ github.event.inputs.job_id }}"
 
+      # the action has no prompt_file input — read PROMPT.md into a (multiline-safe)
+      # step output and pass it via the `prompt` input.
+      - name: Load PROMPT.md
+        id: prompt
+        run: |
+          {
+            echo 'content<<BLUEBIC_PROMPT_EOF'
+            cat /tmp/bluebic/PROMPT.md
+            echo 'BLUEBIC_PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       # headless Claude Code: PROMPT.md = verbatim D.3 system prompt + injected context.
       # --add-dir mounts the KB read-only-ish for grounding; allowedTools scopes the
       # agent to read/edit + the git/test commands it needs (it commits; the harness
@@ -102,7 +113,7 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt_file: /tmp/bluebic/PROMPT.md
+          prompt: ${{ steps.prompt.outputs.content }}
           claude_args: >-
             --model claude-opus-4-8
             --max-turns 40
