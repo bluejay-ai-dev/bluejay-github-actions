@@ -1,0 +1,136 @@
+name: BlueBic Runner
+
+# fired by the dashboard via workflow_dispatch (POST /api/bluebic/jobs).
+# diagnoses one failed chat, opens ONE fix PR against the target repo's dev branch,
+# and reports status back to the dashboard callback. reviewable code only — never
+# auto-merges, draft PR for sensitive paths.
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "bluebic job id (uuid)"
+        required: true
+        type: string
+      chat_id:
+        description: "failed chat id (uuid)"
+        required: true
+        type: string
+      organization_id:
+        description: "org id (may be empty)"
+        required: false
+        type: string
+      failure_mode:
+        description: "judge failure_mode"
+        required: false
+        type: string
+
+permissions:
+  contents: write        # push the bluebic branch (own repo + via BLUEBIC_GH_TOKEN on the target)
+  pull-requests: write   # open the PR
+
+concurrency:
+  group: bluebic-${{ github.event.inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  bluebic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # hard wall-clock cap (cost / runaway rail)
+    steps:
+      # the runner scripts (repo-map / prepare / ship / report) live here.
+      - name: Checkout actions repo (runner scripts)
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # @actions/core is already a dependency of this repo (used by the simulation action).
+      - name: Install runner deps
+        run: npm ci
+
+      - name: Mark RUNNING
+        run: node scripts/bluebic/report.mjs RUNNING --run-url "$RUN_URL"
+        env:
+          BLUEBIC_JOB_ID: ${{ github.event.inputs.job_id }}
+          BLUEBIC_CALLBACK_URL: ${{ secrets.BLUEBIC_CALLBACK_URL }}
+          BLUEBIC_CALLBACK_TOKEN: ${{ secrets.BLUEBIC_CALLBACK_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # resolve target_repo from failure_mode + assemble /tmp/bluebic/{context,PROMPT}.md
+      - name: Resolve target repo + gather context
+        id: prep
+        run: node scripts/bluebic/prepare.mjs
+        env:
+          BLUEBIC_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          BLUEBIC_ORG_ID: ${{ github.event.inputs.organization_id }}
+          BLUEBIC_FAILURE_MODE: ${{ github.event.inputs.failure_mode }}
+          BLUEJAY_MCP_URL: ${{ secrets.BLUEJAY_MCP_URL }}          # transcript + metrics read
+          BLUEJAY_MCP_TOKEN: ${{ secrets.BLUEJAY_MCP_TOKEN }}      # scoped supabase bearer for the runner identity
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}               # degraded fallback read (optional)
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      - name: Checkout target repo (base = dev)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.prep.outputs.target_repo }}
+          ref: dev                                  # house rule: branch off dev
+          token: ${{ secrets.BLUEBIC_GH_TOKEN }}    # PAT with contents+PR write on the repo allowlist
+          path: target
+
+      - name: Clone knowledge base (KB context — mounted as files, no MCP in CI)
+        uses: actions/checkout@v4
+        with:
+          repository: bluejay-ai-dev/knowledge_base
+          ref: main
+          token: ${{ secrets.BLUEBIC_GH_TOKEN }}
+          path: knowledge_base
+
+      - name: Create the BlueBic branch
+        working-directory: target
+        run: |
+          git config user.name  "bluebic[bot]"
+          git config user.email "bluebic@getbluejay.ai"
+          git checkout -b "bluebic/${{ github.event.inputs.chat_id }}-${{ github.event.inputs.job_id }}"
+
+      # headless Claude Code: PROMPT.md = verbatim D.3 system prompt + injected context.
+      # --add-dir mounts the KB read-only-ish for grounding; allowedTools scopes the
+      # agent to read/edit + the git/test commands it needs (it commits; the harness
+      # ships). --permission-mode acceptEdits lets it edit without interactive prompts.
+      - name: Run BlueBic (headless Claude Code)
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt_file: /tmp/bluebic/PROMPT.md
+          claude_args: >-
+            --model claude-opus-4-8
+            --max-turns 40
+            --permission-mode acceptEdits
+            --add-dir ${{ github.workspace }}/knowledge_base
+            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(git status),Bash(git diff:*),Bash(git add:*),Bash(git commit:*),Bash(npm test:*),Bash(npx tsc:*),Bash(pytest:*)"
+        env:
+          CLAUDE_WORKING_DIR: ${{ github.workspace }}/target
+
+      # inspect the committed diff, push the branch, open the PR. writes RESULT.json.
+      - name: Push branch + open PR
+        if: always()
+        working-directory: target
+        run: node ${{ github.workspace }}/scripts/bluebic/ship.mjs
+        env:
+          GH_TOKEN: ${{ secrets.BLUEBIC_GH_TOKEN }}
+          BLUEBIC_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          BLUEBIC_JOB_ID: ${{ github.event.inputs.job_id }}
+          BLUEBIC_FAILURE_MODE: ${{ github.event.inputs.failure_mode }}
+          BLUEBIC_TARGET_REPO: ${{ steps.prep.outputs.target_repo }}
+          BLUEBIC_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      # PR_OPEN / NO_FIX / NEEDS_REVIEW / FAILED — always runs so the dashboard never
+      # hangs in RUNNING even if an earlier step blew up.
+      - name: Report terminal status
+        if: always()
+        run: node scripts/bluebic/report.mjs --from-result
+        env:
+          BLUEBIC_JOB_ID: ${{ github.event.inputs.job_id }}
+          BLUEBIC_CALLBACK_URL: ${{ secrets.BLUEBIC_CALLBACK_URL }}
+          BLUEBIC_CALLBACK_TOKEN: ${{ secrets.BLUEBIC_CALLBACK_TOKEN }}
