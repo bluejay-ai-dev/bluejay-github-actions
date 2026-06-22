@@ -127,12 +127,14 @@ function main() {
     const prArgs = [
       "pr", "create",
       "--repo", targetRepo,
+      // always open as DRAFT — BlueBic PRs are AI-generated and reviewed before merge (matches the
+      // local runner). needsReview (sensitive paths) additionally flags via status/NEEDS_REVIEW.
+      "--draft",
       "--base", BASE_BRANCH,
       "--head", branch,
       "--title", title,
       "--body", body,
     ];
-    if (needsReview) prArgs.push("--draft");
 
     const prUrl = execFileSync("gh", prArgs, { encoding: "utf8" }).trim().split("\n").pop();
 
