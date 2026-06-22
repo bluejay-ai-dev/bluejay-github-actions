@@ -58,20 +58,25 @@ jobs:
           BLUEBIC_CALLBACK_TOKEN: ${{ secrets.BLUEBIC_CALLBACK_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
-      # resolve target_repo from failure_mode + assemble /tmp/bluebic/{context,PROMPT}.md
+      # resolve target_repo from failure_mode + assemble /tmp/bluebic/{context,PROMPT}.md.
+      # an unmapped failure_mode (abandoned/none/null) emits target_repo="" and pre-writes a
+      # NO_FIX RESULT.json — every target-dependent step below is gated on a non-empty target,
+      # so the run short-circuits straight to the terminal report.
       - name: Resolve target repo + gather context
         id: prep
         run: node scripts/bluebic/prepare.mjs
         env:
+          BLUEBIC_JOB_ID: ${{ github.event.inputs.job_id }}       # read the engineer note (extra_context) off the job row
           BLUEBIC_CHAT_ID: ${{ github.event.inputs.chat_id }}
           BLUEBIC_ORG_ID: ${{ github.event.inputs.organization_id }}
           BLUEBIC_FAILURE_MODE: ${{ github.event.inputs.failure_mode }}
           BLUEJAY_MCP_URL: ${{ secrets.BLUEJAY_MCP_URL }}          # transcript + metrics read
           BLUEJAY_MCP_TOKEN: ${{ secrets.BLUEJAY_MCP_TOKEN }}      # scoped supabase bearer for the runner identity
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}               # degraded fallback read (optional)
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}               # degraded fallback read + extra_context (optional)
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
 
       - name: Checkout target repo (base = dev)
+        if: steps.prep.outputs.target_repo != ''
         uses: actions/checkout@v4
         with:
           repository: ${{ steps.prep.outputs.target_repo }}
@@ -80,6 +85,7 @@ jobs:
           path: target
 
       - name: Clone knowledge base (KB context — mounted as files, no MCP in CI)
+        if: steps.prep.outputs.target_repo != ''
         uses: actions/checkout@v4
         with:
           repository: bluejay-ai-dev/knowledge_base
@@ -88,6 +94,7 @@ jobs:
           path: knowledge_base
 
       - name: Create the BlueBic branch
+        if: steps.prep.outputs.target_repo != ''
         working-directory: target
         run: |
           git config user.name  "bluebic[bot]"
@@ -97,6 +104,7 @@ jobs:
       # the action has no prompt_file input — read PROMPT.md into a (multiline-safe)
       # step output and pass it via the `prompt` input.
       - name: Load PROMPT.md
+        if: steps.prep.outputs.target_repo != ''
         id: prompt
         run: |
           {
@@ -105,11 +113,15 @@ jobs:
             echo 'BLUEBIC_PROMPT_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      # headless Claude Code: PROMPT.md = verbatim D.3 system prompt + injected context.
-      # --add-dir mounts the KB read-only-ish for grounding; allowedTools scopes the
-      # agent to read/edit + the git/test commands it needs (it commits; the harness
-      # ships). --permission-mode acceptEdits lets it edit without interactive prompts.
+      # headless Claude Code: PROMPT.md = the goal-aware D.3-derived prompt + the honest
+      # GH-cage note + injected context (numbered transcript + judge localization + engineer
+      # note). The agent runs at the workspace root; it edits files in target/ and grounds in
+      # knowledge_base/ (both mounted via --add-dir, since the action's auto-detected dir is
+      # this actions-repo checkout). allowedTools scopes the agent to read/edit + READ-ONLY
+      # git (self-check) + scoped tests — staging/commit/push/PR are all the harness's job.
+      # --permission-mode acceptEdits lets it edit without interactive prompts.
       - name: Run BlueBic (headless Claude Code)
+        if: steps.prep.outputs.target_repo != ''
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -118,14 +130,16 @@ jobs:
             --model claude-opus-4-8
             --max-turns 40
             --permission-mode acceptEdits
+            --add-dir ${{ github.workspace }}/target
             --add-dir ${{ github.workspace }}/knowledge_base
-            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(git status),Bash(git diff:*),Bash(git add:*),Bash(git commit:*),Bash(npm test:*),Bash(npx tsc:*),Bash(pytest:*)"
-        env:
-          CLAUDE_WORKING_DIR: ${{ github.workspace }}/target
+            --allowedTools "Read,Edit,Write,Grep,Glob,Bash(git -C target status),Bash(git -C target diff:*),Bash(npm test:*),Bash(npx tsc:*),Bash(pytest:*)"
 
       # inspect the committed diff, push the branch, open the PR. writes RESULT.json.
+      # `always()` so it still runs if the agent step errored (it'll emit FAILED / NO_FIX
+      # from the diff state) — but NOT on the unmapped-failure_mode NO_FIX path, where
+      # prepare.mjs already wrote RESULT.json and there is no ./target to cd into.
       - name: Push branch + open PR
-        if: always()
+        if: always() && steps.prep.outputs.target_repo != ''
         working-directory: target
         run: node ${{ github.workspace }}/scripts/bluebic/ship.mjs
         env:

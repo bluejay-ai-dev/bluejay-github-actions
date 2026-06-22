@@ -17,7 +17,8 @@ const NOTE_PATH = "/tmp/bluebic/RESULT_NOTE.md";
 const BASE_BRANCH = "dev"; // house rule: branch off + target dev
 
 // paths that demand a human: open the PR as DRAFT, status NEEDS_REVIEW.
-const SENSITIVE = [/auth/i, /secret/i, /env/i, /(^|\/)migrations\//i, /iam/i];
+// kept in lockstep with the local runner's SENSITIVE_RE (dashboard scripts/bluebic-runner.mjs).
+const SENSITIVE = [/auth/i, /secret/i, /\.env/i, /migration/i, /iam/i, /credential/i];
 
 function git(args) {
   return execFileSync("git", args, { encoding: "utf8" }).trim();
@@ -58,6 +59,20 @@ function main() {
   if (["main", "dev", "master"].includes(branch)) {
     writeResult({ status: "FAILED", error: `refusing to ship from protected branch "${branch}"`, run_url: runUrl });
     return;
+  }
+
+  // the harness owns the commit (mirrors the local runner): if the agent left edits in the
+  // working tree without committing, stage + commit them here so the diff below is
+  // authoritative. scoped to tracked changes + new files; never amend, never --no-verify.
+  // a clean tree (NO_FIX) is the no-op case — `commit` errors out and we fall through.
+  if (git(["status", "--porcelain"])) {
+    git(["add", "-A"]);
+    const msg = `BlueBic: fix ${failureMode} from chat ${chatId.replace(/-/g, "").slice(0, 8)}\n\n${rootCause || "AI-diagnosed fix."}\n\nCo-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`;
+    try {
+      git(["commit", "-m", msg]);
+    } catch {
+      // nothing staged (e.g. only ignored files) → leave HEAD as-is; the diff check is NO_FIX.
+    }
   }
 
   // empty diff vs dev → no code change was made → NO_FIX.
