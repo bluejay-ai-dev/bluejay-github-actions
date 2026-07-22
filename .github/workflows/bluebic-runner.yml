@@ -23,6 +23,12 @@ on:
         description: "judge failure_mode"
         required: false
         type: string
+      # declared so the dashboard's dispatch (which always sends batch_id) isn't 422-rejected;
+      # no step consumes it — the DB child row already carries the batch linkage.
+      batch_id:
+        description: "batch parent id (uuid); empty for a standalone fix"
+        required: false
+        type: string
 
 permissions:
   contents: write        # push the bluebic branch (own repo + via BLUEBIC_GH_TOKEN on the target)
