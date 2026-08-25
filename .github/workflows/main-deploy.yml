@@ -1,0 +1,97 @@
+name: deploy-to-main
+on:
+  workflow_dispatch:
+    inputs:
+      ticket:
+        description: ENG-123
+        required: true
+      confirm:
+        description: type "i have tested this"
+        required: true
+
+env:
+  ORG: bluejay-ai-dev
+  PHRASE: i have tested this
+  ORDER: bluejay_middleware livekit_agent text_agent evals docs bluejay_frontend_v2
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci && npx playwright install --with-deps chromium
+        working-directory: integration
+      - run: npx playwright test core.spec.ts
+        working-directory: integration
+        env:
+          BLUEJAY_ENV: dev
+          BLUEJAY_EMAIL: ${{ secrets.E2E_EMAIL }}
+          BLUEJAY_PASSWORD: ${{ secrets.E2E_PASSWORD }}
+
+  promote:
+    needs: integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: token
+        with:
+          app-id: ${{ vars.DEPLOY_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_KEY }}
+          owner: bluejay-ai-dev
+
+      - env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          typed=$(tr '[:upper:]' '[:lower:]' <<<"$CONFIRM" | xargs)
+          if [ "$typed" != "$PHRASE" ]; then
+            echo "type exactly: $PHRASE"
+            exit 1
+          fi
+
+      - env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ID: ${{ inputs.ticket }}
+        run: |
+          set -euo pipefail
+          has() { printf '%s\n' $2 | grep -qx -- "$1"; }
+          repos_for() {
+            gh search prs --owner "$ORG" --match title "$1" --json repository,title \
+              -q ".[] | select(.title | test(\"\\\\b$1\\\\b\";\"i\")) | .repository.name" | sort -u
+          }
+
+          repos=$(repos_for "$ID")
+          seen=""
+          changed=1
+          while [ "$changed" = 1 ]; do
+            changed=0
+            for repo in $repos; do
+              for t in $(gh api "repos/$ORG/$repo/compare/main...dev" -q '.commits[].commit.message' \
+                         | grep -oE 'ENG-[0-9]+' | sort -u); do
+                if has "$t" "$seen"; then continue; fi
+                seen="$seen $t"
+                changed=1
+                for r in $(repos_for "$t"); do
+                  if ! has "$r" "$repos"; then repos="$repos $r"; fi
+                done
+              done
+            done
+          done
+
+          echo "tickets: $seen" >> "$GITHUB_STEP_SUMMARY"
+          ordered=""
+          for r in $ORDER; do
+            if has "$r" "$repos"; then ordered="$ordered $r"; fi
+          done
+          for r in $repos; do
+            if ! has "$r" "$ORDER"; then ordered="$ordered $r"; fi
+          done
+
+          for repo in $ordered; do
+            if ! sha=$(gh api "repos/$ORG/$repo/git/ref/heads/dev" -q .object.sha 2>/dev/null); then
+              echo "skip $repo, no dev branch" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            gh api -X POST "repos/$ORG/$repo/merges" -f base=main -f head="$sha" \
+              -f commit_message="promote $repo dev to main"
+            echo "promoted $repo" >> "$GITHUB_STEP_SUMMARY"
+          done
