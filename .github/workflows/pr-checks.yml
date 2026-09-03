@@ -1,0 +1,120 @@
+name: pr-checks
+
+# Reusable. App repos call it from their own thin wrapper, which is what keeps the
+# scripts in one place instead of copied into seven repos.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  ticket:
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.parse.outputs.id }}
+    steps:
+      - id: parse
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          id=$(grep -oiE 'ENG-[0-9]+' <<<"$TITLE" | head -1 | tr '[:lower:]' '[:upper:]' || true)
+          if [ -z "$id" ]; then
+            echo "::error::PR title must contain a ticket id, e.g. ENG-123 short description"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "ticket id: $id" >> "$GITHUB_STEP_SUMMARY"
+
+  related-prs-green:
+    needs: ticket
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.SANDBOX_GH_TOKEN }}
+          ID: ${{ needs.ticket.outputs.id }}
+          SELF: ${{ github.event.repository.name }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "no cross-repo token, did not check sibling PRs" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Code search tokenizes on the hyphen, so re-filter the titles ourselves.
+          gh search prs --owner "$OWNER" --match title "$ID" --state open --limit 50 \
+            --json repository,number,title \
+            -q '.[] | [.repository.name, (.number|tostring), .title] | @tsv' \
+            | awk -F'\t' -v id="$ID" 'toupper($3) ~ ("\\<" toupper(id) "\\>")' > siblings.tsv || true
+
+          fail=0; found=0
+          while IFS=$'\t' read -r repo num title; do
+            [ -z "${repo:-}" ] && continue
+            if [ "$repo" = "$SELF" ] && [ "$num" = "$NUM" ]; then continue; fi
+            found=1
+            bad=$(gh pr view "$num" -R "$OWNER/$repo" --json statusCheckRollup \
+              -q '[.statusCheckRollup[]
+                   | select(.conclusion != null
+                            and (.conclusion | ascii_upcase | IN("SUCCESS","NEUTRAL","SKIPPED") | not))]
+                  | length')
+            echo "- \`$repo#$num\` failing checks: $bad  ($title)" >> "$GITHUB_STEP_SUMMARY"
+            [ "$bad" = 0 ] || fail=1
+          done < siblings.tsv
+
+          [ "$found" = 1 ] || echo "$ID touches this repo only" >> "$GITHUB_STEP_SUMMARY"
+          [ "$fail" = 0 ] || echo "::error::a sibling PR on $ID is red"
+          exit $fail
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: '[ -f Dockerfile ] && docker build -q -t check . || echo "no Dockerfile"'
+      - run: '[ -f package.json ] && npm ci && npm run build --if-present && npm test --if-present || echo "no package.json"'
+
+  deterministic:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      BASE: ${{ github.event.pull_request.base.ref }}
+      TITLE: ${{ github.event.pull_request.title }}
+      BODY: ${{ github.event.pull_request.body }}
+      ADDITIONS: ${{ github.event.pull_request.additions }}
+      GH_TOKEN: ${{ secrets.SANDBOX_GH_TOKEN }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+      INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_PROD_SERVICE: ${{ vars.RAILWAY_PROD_SERVICE }}
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # env-vars refuses to run without this rather than passing having checked nothing,
+      # so it is a real dependency of the job, not a convenience.
+      - name: Install infisical
+        if: env.INFISICAL_TOKEN != ''
+        run: |
+          curl -fsSL -o /tmp/infisical.deb \
+            https://github.com/Infisical/infisical/releases/download/infisical-cli%2Fv0.41.90/infisical_0.41.90_linux_amd64.deb
+          sudo dpkg -i /tmp/infisical.deb >/dev/null
+      - { if: always(), name: ticket-sane,           run: bin/checks.sh ticket-sane }
+      - { if: always(), name: video,                 run: bin/checks.sh video }
+      - { if: always(), name: migrations-immutable,  run: bin/checks.sh migrations-immutable }
+      - { if: always(), name: migrations-newest,     run: bin/checks.sh migrations-newest }
+      - { if: always(), name: migrations-have-down,  run: bin/checks.sh migrations-have-down }
+      - { if: always(), name: migrations-round-trip, run: bin/checks.sh migrations-round-trip }
+      - { if: always(), name: rls,                   run: bin/checks.sh rls }
+      - { if: always(), name: codegen,               run: bin/checks.sh codegen }
+      - { if: always(), name: env-vars,              run: bin/checks.sh env-vars }
+      - { if: always(), name: deps-bounded,          run: bin/checks.sh deps-bounded }

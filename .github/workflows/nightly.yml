@@ -1,0 +1,141 @@
+# Nightly health check against prod.
+#
+# The promotion gate runs the same suite.sh before a release. This runs it after, on a
+# schedule, because the failure that started this ran green through every check and still
+# took sign-in down: the release was fine, the ORDER it reached prod in was not. Nothing
+# that inspects a pull request can see that. Only something that talks to prod can.
+#
+# It pages on red and stays quiet on amber, because a nightly that cries about a carrier
+# dropping one call is a nightly people mute, and a muted nightly is worse than none.
+name: nightly
+
+on:
+  schedule:
+    - cron: '0 9 * * *'   # 02:00 PT / 09:00 UTC, before anyone is working
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: 'Parts to run (blank = the full run)'
+        required: false
+        default: ''
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+# Least privilege: this reads the repo and talks to Railway and GHCR with their own
+# tokens. Without this block it inherits the repo default, which can be write-all.
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      verdict: ${{ steps.run.outputs.verdict }}
+      summary: ${{ steps.run.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('bin/package.json') }}
+
+      - name: Install
+        working-directory: bin
+        run: npm ci --silent && npx playwright install --with-deps chromium
+
+      # Proves the classifier and the chat tap still behave before anything is believed
+      # about prod. It is offline, so it cannot be the thing that is broken.
+      - name: Self-check
+        working-directory: bin
+        run: ./suite.sh selftest
+
+      - name: Run the suite against prod
+        id: run
+        working-directory: bin
+        env:
+          SUITE_FRONTEND_URL: ${{ vars.PROD_FRONTEND_URL }}
+          SUITE_API_URL: ${{ vars.PROD_API_URL }}
+          TEST_SUITE_BLUEJAY_API_KEY: ${{ secrets.NIGHTLY_BLUEJAY_API_KEY }}
+          TEST_SUITE_BLUEJAY_API_KEY_B: ${{ secrets.NIGHTLY_BLUEJAY_API_KEY_B }}
+          SUITE_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          SUITE_SUPABASE_ANON_KEY: ${{ secrets.PROD_SUPABASE_ANON_KEY }}
+          SUITE_SUPABASE_SERVICE_KEY: ${{ secrets.PROD_SUPABASE_SERVICE_KEY }}
+          SUITE_USER_EMAIL: ${{ secrets.NIGHTLY_USER_EMAIL }}
+          SUITE_EXPECT_CAPTCHA: '1'
+          TEST_SUITE_SIM_TEXT: ${{ vars.NIGHTLY_SIM_TEXT }}
+          TEST_SUITE_SIM_SMS: ${{ vars.NIGHTLY_SIM_SMS }}
+          TEST_SUITE_SIM_OUTBOUND: ${{ vars.NIGHTLY_SIM_OUTBOUND }}
+          TEST_SUITE_AGENT_OUTBOUND: ${{ vars.NIGHTLY_AGENT_OUTBOUND }}
+          TEST_SUITE_SIM_INBOUND: ${{ vars.NIGHTLY_SIM_INBOUND }}
+          TEST_SUITE_AGENT_INBOUND: ${{ vars.NIGHTLY_AGENT_INBOUND }}
+          TEST_SUITE_AGENT_ID: ${{ vars.NIGHTLY_AGENT_ID }}
+          TEST_SUITE_ECHO_URL: ${{ vars.NIGHTLY_ECHO_URL }}
+        run: |
+          set +e
+          if [ -n "${{ inputs.parts }}" ]; then
+            for p in ${{ inputs.parts }}; do ./suite.sh "$p"; done 2>&1 | tee /tmp/out
+          else
+            ./suite.sh run 2>&1 | tee /tmp/out
+          fi
+          rc=${PIPESTATUS[0]}
+          case $rc in
+            0) v=green ;;
+            3) v=fixture ;;   # our own test data rotted; not a product failure
+            4) v=config ;;    # a provider's credentials are red
+            *) v=red ;;
+          esac
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"
+          {
+            echo 'summary<<EOF'
+            grep -E '^(ok|FAIL|MISS|AMBER)' /tmp/out | head -20
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          echo "### nightly: $v" >> "$GITHUB_STEP_SUMMARY"
+          sed -n '1,60p' /tmp/out >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ github.run_id }}
+          path: |
+            /tmp/out
+            /tmp/suite-*.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+  tell-us:
+    needs: suite
+    if: always() && needs.suite.result != 'success'
+    runs-on: ubuntu-latest
+    steps:
+      # Three different things went wrong, and they go to different people. A red is the
+      # product; a fixture is us; a config is a provider account. One shared "nightly
+      # failed" message trains everyone to ignore all three.
+      - name: Post to Slack
+        env:
+          HOOK: ${{ secrets.SLACK_NIGHTLY_WEBHOOK }}
+          VERDICT: ${{ needs.suite.outputs.verdict }}
+          SUMMARY: ${{ needs.suite.outputs.summary }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$HOOK" ] || { echo "::warning::SLACK_NIGHTLY_WEBHOOK unset, nobody was told"; exit 0; }
+          case "$VERDICT" in
+            red)     head="prod nightly is red" ;;
+            fixture) head="nightly could not run: its own fixtures are gone" ;;
+            config)  head="nightly stopped early: a provider's credentials are red" ;;
+            *)       head="nightly failed before it reached the suite" ;;
+          esac
+          jq -n --arg t "$head" --arg s "$SUMMARY" --arg u "$RUN" \
+            '{text: ($t + "\n```" + $s + "```\n" + $u)}' \
+            | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$HOOK" >/dev/null
