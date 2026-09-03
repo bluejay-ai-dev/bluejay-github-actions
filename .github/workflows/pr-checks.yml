@@ -50,7 +50,8 @@ jobs:
           gh search prs --owner "$OWNER" --match title "$ID" --state open --limit 50 \
             --json repository,number,title \
             -q '.[] | [.repository.name, (.number|tostring), .title] | @tsv' \
-            | awk -F'\t' -v id="$ID" 'toupper($3) ~ ("\\<" toupper(id) "\\>")' > siblings.tsv || true
+            > raw.tsv || { echo "::error::sibling search failed; refusing to pass without knowing"; exit 1; }
+          awk -F'\t' -v id="$ID" 'toupper($3) ~ ("\\<" toupper(id) "\\>")' raw.tsv > siblings.tsv
 
           fail=0; found=0
           while IFS=$'\t' read -r repo num title; do
@@ -59,8 +60,8 @@ jobs:
             found=1
             bad=$(gh pr view "$num" -R "$OWNER/$repo" --json statusCheckRollup \
               -q '[.statusCheckRollup[]
-                   | select(.conclusion != null
-                            and (.conclusion | ascii_upcase | IN("SUCCESS","NEUTRAL","SKIPPED") | not))]
+                   | (.conclusion // .state // "PENDING") | ascii_upcase
+                   | select(IN("SUCCESS","NEUTRAL","SKIPPED") | not)]
                   | length')
             echo "- \`$repo#$num\` failing checks: $bad  ($title)" >> "$GITHUB_STEP_SUMMARY"
             [ "$bad" = 0 ] || fail=1

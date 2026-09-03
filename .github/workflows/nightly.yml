@@ -71,6 +71,9 @@ jobs:
           SUITE_SUPABASE_SERVICE_KEY: ${{ secrets.PROD_SUPABASE_SERVICE_KEY }}
           SUITE_USER_EMAIL: ${{ secrets.NIGHTLY_USER_EMAIL }}
           SUITE_EXPECT_CAPTCHA: '1'
+          # The gate runs these only when their paths change. Nightly is the full matrix,
+          # so ask for them explicitly; missing fixtures then report as fixture, not silence.
+          SUITE_CHANGED: 'redteam uptime'
           TEST_SUITE_SIM_TEXT: ${{ vars.NIGHTLY_SIM_TEXT }}
           TEST_SUITE_SIM_SMS: ${{ vars.NIGHTLY_SIM_SMS }}
           TEST_SUITE_SIM_OUTBOUND: ${{ vars.NIGHTLY_SIM_OUTBOUND }}
@@ -104,6 +107,7 @@ jobs:
             0) v=green ;;
             3) v=fixture ;;   # our test data rotted, not a product failure
             4) v=config ;;    # a provider's credentials are red
+            5) v=amber ;;     # carrier had a bad night; `run` retries internally, a single part cannot
             *) v=red ;;
           esac
           echo "verdict=$v" >> "$GITHUB_OUTPUT"
@@ -114,6 +118,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "### nightly: $v" >> "$GITHUB_STEP_SUMMARY"
           sed -n '1,60p' /tmp/out >> "$GITHUB_STEP_SUMMARY"
+          # Amber must not fail the job, or the verdict is cosmetic and a dropped call pages.
+          [ "$v" = amber ] && exit 0
           exit $rc
 
       - name: Keep the evidence
