@@ -1,24 +1,20 @@
-// Onboarding half of the nightly: can a brand new account get from nothing to inside an
-// organization. This is the path the ENG-544 release broke on 2026-09-02, and nothing
-// else in the suite touches it, because every other part signs in as a fixture user that
-// already has an org.
+// Onboarding: can a brand new account reach an organization. Every other part of the
+// suite signs in as a fixture user that already has one, so nothing else covers this.
 //
 //   node signup.mjs <frontend_url>
 //
 // Exit: 0 | 1 regression | 3 fixture or prerequisite missing
 //
-// It does NOT complete the public sign-up form. Turnstile gates the submit button on any
-// deployment with NEXT_PUBLIC_TURNSTILE_SITE_KEY set, and a headless browser cannot solve
-// it. Pretending otherwise would give a green nightly that proves nothing. So the form is
-// asserted as far as it renders, and the part a captcha does not protect, everything
-// after the account exists, is driven with a real new account instead.
+// It does NOT submit the public form: Turnstile gates the button wherever
+// NEXT_PUBLIC_TURNSTILE_SITE_KEY is set. The form is asserted as far as it renders, and
+// everything a captcha never protected is driven with a real new account.
 import { loggedInContext, createUser, deleteUser, die, need } from "./session.mjs";
 
 const BASE = (process.argv[2] ?? "").replace(/\/$/, "");
 if (!BASE) die("usage: signup.mjs <frontend_url>", 3);
 need("SUITE_SUPABASE_SERVICE_KEY");
 
-// A domain we own and can receive at, so a bounce is never someone else's problem.
+// A domain we own and receive at, so a bounce is never someone else's problem.
 const domain = process.env.SUITE_SIGNUP_DOMAIN ?? "bluejaysims.com";
 const email = `gate+signup-${Date.now()}@${domain}`;
 const password = `Gate-${Math.random().toString(36).slice(2)}-${Date.now()}`;
@@ -36,8 +32,7 @@ const fail = async (m, code = 1) => {
   process.exit(code);
 };
 
-// 1. the public form still renders, and still has its captcha. A signup page that lost
-// Turnstile is a worse bug than one that is down, so this asserts presence, not absence.
+// Asserts the captcha is PRESENT: a signup page that lost Turnstile is worse than one that is down.
 {
   const { browser: b, ctx } = await loggedInContext(BASE);
   browser = b;
@@ -57,9 +52,7 @@ const fail = async (m, code = 1) => {
   browser = null; page = null;
 }
 
-// 2. a genuinely new account, taken through whatever onboarding it lands in. Created
-// through the admin API because Turnstile owns the form, not because the form is skipped
-// for convenience: everything from here on is the code a captcha never protected.
+// Created through the admin API because Turnstile owns the form, not for convenience.
 userId = await createUser(email, password);
 
 const { browser: b2, ctx: ctx2 } = await loggedInContext(BASE, { email });
@@ -78,9 +71,8 @@ for (const bad of [/something went wrong/i, /internal server error/i, /does not 
   if (bad.test(text)) await fail(`new account landed on an error page: ${text.slice(0, 160).replace(/\s+/g, " ")}`);
 }
 
-// It is allowed to land on onboarding, a join-org prompt, an org picker, or the app. It is
-// not allowed to land nowhere, and it is not allowed to loop. The redirect loop is the one
-// this is really watching for: that is what a broken org resolution looks like from outside.
+// Onboarding, a join prompt, a picker or the app are all fine. A redirect loop is not:
+// that is what broken org resolution looks like from outside.
 const first = page.url();
 await page.goto(`${BASE}/`, { waitUntil: "domcontentloaded" });
 await page.waitForTimeout(7000);

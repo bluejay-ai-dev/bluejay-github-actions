@@ -11,7 +11,7 @@ name: nightly
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # 02:00 PT / 09:00 UTC, before anyone is working
+    - cron: '0 9 * * *'   # 09:00 UTC, so 01:00 PST / 02:00 PDT
   workflow_dispatch:
     inputs:
       parts:
@@ -31,7 +31,7 @@ permissions:
 jobs:
   suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     outputs:
       verdict: ${{ steps.run.outputs.verdict }}
       summary: ${{ steps.run.outputs.summary }}
@@ -79,17 +79,30 @@ jobs:
           TEST_SUITE_AGENT_INBOUND: ${{ vars.NIGHTLY_AGENT_INBOUND }}
           TEST_SUITE_AGENT_ID: ${{ vars.NIGHTLY_AGENT_ID }}
           TEST_SUITE_ECHO_URL: ${{ vars.NIGHTLY_ECHO_URL }}
+          PARTS: ${{ inputs.parts }}
         run: |
           set +e
-          if [ -n "${{ inputs.parts }}" ]; then
-            for p in ${{ inputs.parts }}; do ./suite.sh "$p"; done 2>&1 | tee /tmp/out
+          # PARTS is caller input: allowlisted, never interpolated into the shell.
+          rc=0
+          if [ -n "$PARTS" ]; then
+            for p in $PARTS; do
+              case "$p" in
+                preflight|sha|creds|signup|text|sms|traces|browser|bluejayai|outbound|inbound|redteam|uptime) ;;
+                *) echo "refusing unknown part: $p"; exit 2 ;;
+              esac
+            done
+            for p in $PARTS; do
+              ./suite.sh "$p" 2>&1 | tee -a /tmp/out
+              prc=${PIPESTATUS[0]}
+              [ "$prc" = 0 ] || rc=$prc   # keep the first real failure, not the last part's status
+            done
           else
             ./suite.sh run 2>&1 | tee /tmp/out
+            rc=${PIPESTATUS[0]}
           fi
-          rc=${PIPESTATUS[0]}
           case $rc in
             0) v=green ;;
-            3) v=fixture ;;   # our own test data rotted; not a product failure
+            3) v=fixture ;;   # our test data rotted, not a product failure
             4) v=config ;;    # a provider's credentials are red
             *) v=red ;;
           esac
@@ -138,4 +151,4 @@ jobs:
           esac
           jq -n --arg t "$head" --arg s "$SUMMARY" --arg u "$RUN" \
             '{text: ($t + "\n```" + $s + "```\n" + $u)}' \
-            | curl -sS -X POST -H 'Content-Type: application/json' -d @- "$HOOK" >/dev/null
+            | curl -sS --fail --max-time 30 -X POST -H 'Content-Type: application/json' -d @- "$HOOK" >/dev/null

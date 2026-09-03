@@ -1,20 +1,12 @@
-// Bluejay AI half of the gate: the in-app assistant, its file attachment path, and the
-// MCP round trip that is the only way it can write anything.
+// Bluejay AI: the composer, the attachment path, and the MCP round trip it writes through.
 //
 //   BJAI_DH_1=.. BJAI_DH_2=.. BJAI_AGENT_ID=.. BJAI_TOKEN=.. node bluejay-ai.mjs <frontend_url>
 //
-// Exit: 0 the model called through to MCP and finished | 1 regression | 3 fixture missing
-//       4 the environment is not configured for chat | 5 amber, it never made the call
+// Exit: 0 ok | 1 regression | 3 fixture missing | 4 chat not configured | 5 amber, no tool call
 //
-// What this asserts is plumbing, never answer quality. The composer renders, a file gets
-// through presign + PUT + complete, the stream opens, and a tool call reaches the MCP
-// server and comes back without an error. Whether the model picked the right tool is the
-// caller's problem: suite.sh reads the database afterwards and decides.
-//
-// The attachment is deliberately NOT the carrier for the values being written. Document
-// extraction is advertised at 2-3 minutes and allowed 15, so waiting on the parsed
-// content would cost more than the whole rest of the suite and would prove nothing extra
-// about the upload path, which is already fully crossed by the time `complete` returns.
+// Asserts plumbing, never answer quality; suite.sh reads the database afterwards.
+// The attachment is not the carrier for the values written: extraction takes 2-15 minutes
+// and proves nothing more about the upload path than `complete` returning does.
 import { writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,8 +24,7 @@ if (!BASE || !DH1 || !DH2 || !AGENT || !TOKEN)
 const E_FAIL = 1, E_CONFIG = 4, E_AMBER = 5;
 const DEADLINE_MS = Number(process.env.BJAI_DEADLINE_MS ?? 240_000);
 
-// A CSV, because the composer only accepts .pdf/.doc/.docx/.csv/.xlsx and a CSV is the
-// one of those we can write honestly in three lines.
+// The composer only accepts .pdf/.doc/.docx/.csv/.xlsx.
 const csv = join(tmpdir(), `bluejay-ai-${TOKEN}.csv`);
 writeFileSync(csv,
   "name,persona,note\n" +
@@ -61,27 +52,23 @@ const fail = async (m, code = E_FAIL) => {
   process.exit(code);
 };
 
-// 1. the assistant renders and we are actually signed in
 await page.goto(`${BASE}/bluejay-ai`, { waitUntil: "domcontentloaded" });
 await page.waitForTimeout(7000);
 if (page.url().includes("/auth/")) await fail("bounced to login, session cookie rejected", 3);
 
-// The composer is a tiptap editor in some states and a plain textarea in others, so take
-// whichever one this build rendered rather than assuming.
+// tiptap in some states, a plain textarea in others.
 const editor = page.locator(".ProseMirror").first();
 const textarea = page.getByPlaceholder(/Ask Bluejay/i).first();
 const useEditor = await editor.isVisible().catch(() => false);
 if (!useEditor && !(await textarea.isVisible().catch(() => false)))
   await fail("composer never rendered on /bluejay-ai");
 
-// 2. attach a file. The input is hidden behind a paperclip button; set it directly,
-// which is what a real click ends up doing anyway.
+// The input is hidden behind a paperclip button; setting it is what a click does anyway.
 const fileInput = page.locator('input[type="file"]').first();
 if ((await fileInput.count()) === 0) await fail("no file input on the composer, attachments are gone");
 await fileInput.setInputFiles(csv);
 
-// presign -> S3 PUT -> complete. Wait on the app's own calls, not on a chip, because the
-// chip is cosmetic and the three requests are the actual path being gated.
+// Wait on presign/PUT/complete, not on the attachment chip, which is cosmetic.
 const uploadOk = await page
   .waitForFunction(() => {
     const u = window.__bjai?.uploads ?? [];
@@ -93,14 +80,13 @@ const uploadOk = await page
 const up = await page.evaluate(() => window.__bjai?.uploads ?? []);
 const badUpload = up.find((x) => x.status >= 400);
 if (badUpload) {
-  // 401/403 here is the fixture user losing access, not the product breaking.
+  // 401/403 is the fixture user losing access, not the product breaking.
   const code = [401, 403].includes(badUpload.status) ? 3 : E_FAIL;
   await fail(`chat file ${badUpload.url} -> ${badUpload.status}`, code);
 }
 if (!uploadOk) await fail(`attachment never completed: ${JSON.stringify(up)}`);
 
-// 3. ask for the writes. Both ids are named explicitly: this gates whether a tool call
-// can reach MCP and land, not whether the model can guess which record was meant.
+// Ids are named explicitly: this gates whether a tool call lands, not whether the model guesses.
 const prompt =
   `Use your Bluejay tools to make these exact changes, then stop. ` +
   `1) Update digital human ${DH1}: set its name to "${TOKEN}-1". ` +
@@ -115,7 +101,6 @@ const send = page.locator('[data-tour-id="chat-send"]').first();
 if (!(await send.isEnabled().catch(() => false))) await fail("send button never became enabled");
 await send.click();
 
-// 4. the stream has to open at all
 const opened = await page
   .waitForFunction(() => (window.__bjai?.chat ?? []).length > 0, null, { timeout: 60_000 })
   .then(() => true).catch(() => false);
@@ -126,42 +111,35 @@ const bad = chat.find((c) => c.status >= 400);
 if (bad) {
   const bodies = await page.evaluate(() => window.__bjai.bodies ?? []);
   const text = bodies.join(" ");
-  // The route returns exactly this when the deployment has no MCP URLs wired, which is a
-  // configuration problem in the environment, not a regression in the code being gated.
+  // No MCP URLs wired is the environment being wrong, not the code.
   if (/MCP_SERVER_URL|DOCS_MCP_SERVER_URL/.test(text))
     await fail(`chat route is not configured for MCP: ${text.slice(0, 200)}`, E_CONFIG);
   await fail(`/api/chat -> ${bad.status}`);
 }
 
-// 5. wait for it to finish, or for a tool call to have happened, whichever lands first.
-// A model that called the tool and then rambles for another minute has already proven
-// everything this part exists to prove.
+// Whichever lands first: a tool call already proves what this part exists to prove.
 await page
   .waitForFunction(() => window.__bjai?.done === true || (window.__bjai?.tools ?? []).length > 0,
     null, { timeout: DEADLINE_MS })
   .catch(() => {});
-// Give a tool call that just started time to come back with its result.
 if (await page.evaluate(() => (window.__bjai?.tools ?? []).length > 0 && !window.__bjai.done))
   await page.waitForFunction(() => window.__bjai?.done === true, null, { timeout: 90_000 }).catch(() => {});
 
 const s = await page.evaluate(() => window.__bjai);
 
-// An MCP tool that comes back is_error means the server refused us: a bad authorization
-// token, an unreachable middleware, a tool that no longer exists. All regressions.
+// is_error means the MCP server refused us: bad token, unreachable, or gone. All regressions.
 if (s.toolErrors.length) await fail(`MCP tool returned an error: ${s.toolErrors[0]}`);
 if (!s.events.length) await fail("the chat stream produced no events");
 
 await browser.close();
 
 if (!s.tools.length) {
-  // Everything worked and the model simply did not call a tool. That is a bad day, not a
-  // broken build, so it retries once and only then counts against the batch.
+  // Nothing broke, the model just did not call a tool. Amber retries once.
   console.error(`AMBER bluejay-ai: stream ran (${s.events.length} events, blocks: ` +
     `${s.blocks.join(",") || "none"}) but no MCP tool was called`);
   process.exit(E_AMBER);
 }
-// suite.sh reads this to tell "the model never tried" apart from "the tool said it wrote
-// and nothing changed", which are an amber and a regression respectively.
+// Lets suite.sh tell "never tried" (amber) from "said it wrote, nothing changed" (red).
 writeFileSync("/tmp/suite.bjai.env", `BJAI_TOOLS='${s.tools.join(",").replace(/'/g, "")}'\n`);
 console.log(`ok bluejay-ai: attachment uploaded, ${s.events.length} stream events, ` +
   `tools called: ${s.tools.join(", ")}`);

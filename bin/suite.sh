@@ -25,11 +25,7 @@ ok()   { printf 'ok   %-9s %s\n' "$1" "${2:-}"; }
 bad()  { printf 'FAIL %-9s %s\n' "$1" "${2:-}" >&2; }
 miss() { printf 'MISS %-9s %s\n' "$1" "${2:-}" >&2; exit $E_FIXTURE; }
 
-# Inside $( ) the miss below exits the SUBSHELL, so a caller that writes
-#   x=$(need FOO)
-# keeps going with x empty unless it also checks the status. Always write
-#   x=$(need FOO) || return $E_FIXTURE
-# or call it bare, as preflight does.
+# miss exits the SUBSHELL inside $( ), so callers must write `x=$(need FOO) || return $E_FIXTURE`.
 need() {
   local v=${!1:-}
   [ -n "$v" ] || miss fixture "$1 is unset"
@@ -60,18 +56,16 @@ verdict() {
   esac
 }
 
-# error_code lives on test_results but is not on the REST response yet, so classify on
-# status. Every AUTH/MISSING/DECRYPT/BRIDGE code lands on NO_CONNECTION anyway; the code
-# is only ever extra detail in the failure line.
+# error_code is not on the REST response yet. Every AUTH/MISSING/DECRYPT/BRIDGE code lands
+# on NO_CONNECTION anyway, so status is equivalent.
 result_of() {
   local code; code=$(call GET "/v1/retrieve-simulation-result/$1")
   [ "$code" = 200 ] || { echo "HTTP_$code"; return; }
   body | jq -r '.simulation_result.status // "UNKNOWN"'
 }
 
-# Deadline per state transition, not one for the whole test. Queueing returns before
-# dispatch, so a 200 from the queue endpoint means nothing and a stuck dispatch has to
-# fail in 45s rather than burn the whole 300.
+# Deadline per transition, not per test: queueing returns before dispatch, so a stuck
+# dispatch fails in 45s instead of burning 300.
 await() {  # await <result_id> <wanted...|deadline> ; echoes the status it settled on
   local id=$1 want=$2 deadline=$3 end=$((SECONDS + deadline)) s
   while [ $SECONDS -lt "$end" ]; do
@@ -83,9 +77,8 @@ await() {  # await <result_id> <wanted...|deadline> ; echoes the status it settl
   echo "STUCK_IN_${s:-UNKNOWN}"
 }
 
-# livekit_agent_name comes off the fixture agent row, never the call site. Mandatory for
-# LIVEKIT agents, must stay unset for the bridge providers: backwards one way is
-# NO_CONNECTION, backwards the other is NO_ANSWER.
+# From the agent row, never the call site. Required for LIVEKIT, must stay unset for
+# bridges; backwards either way looks like NO_CONNECTION or NO_ANSWER.
 agent_run_extra() {
   local code; code=$(call GET "/v1/agents/$1")
   [ "$code" = 200 ] || miss fixture "agent $1 unreadable (HTTP $code)"
@@ -96,9 +89,8 @@ agent_run_extra() {
 
 # ---------------------------------------------------------------- parts
 
-# The fixture manifest, and the only place it lives. A dev DB rebuild has broken the
-# existing suite once already: if a rebuild turns the gate red people learn to override it,
-# and then it is worse than no gate. Hence the separate exit code.
+# The fixture manifest, and the only place it lives. A rebuild that turns the gate red
+# teaches people to override it, hence the separate exit code.
 cmd_preflight() {
   command -v jq >/dev/null || miss preflight "jq not installed"
   command -v node >/dev/null || miss preflight "node not installed"
@@ -264,9 +256,8 @@ cmd_sms() {
   ok sms "$s, $inb in / $outb out"
 }
 
-# Assert the ingest pipeline directly rather than as a side effect of a sim: livekit_agent
-# emits no spans of its own and test_results.trace_ids is customer supplied, so a sim proves
-# nothing about traces. This is faster, deterministic, and tests the thing that breaks.
+# Direct, not as a side effect of a sim: livekit_agent emits no spans and trace_ids is
+# customer supplied, so a sim proves nothing about traces.
 cmd_traces() {
   local seed=${SUITE_EXPECT_SHA:-$(date +%s)}${SUITE_ATTEMPT:-1}
   local tid; tid=$(printf '%s' "$seed" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-32)
@@ -314,9 +305,8 @@ PY
                          | select(. == "organization.id" or . == "collector.environment")] | length')
   [ "$stripped" = 0 ] || { bad traces "$stripped internal tags leaked to the client"; return $E_FAIL; }
 
-  # The case that matters. The historical failure was spans landing with an empty
-  # organization.id, which the org filter then silently drops - and without this you
-  # cannot tell "ingest is broken" from "ingest works but tenancy is wrong".
+  # The case that matters: spans with an empty organization.id get silently dropped, and
+  # without this you cannot tell broken ingest from broken tenancy.
   code=$(call POST "/v1/traces/$tid" "{}" "$KEY_B")
   [ "$code" = 404 ] || { bad traces "second org got HTTP $code on the same trace, expected 404"; return $E_FAIL; }
 
@@ -344,13 +334,8 @@ cmd_signup() {
 
 # ------------------------------------------------------------------ bluejay ai
 
-# The in-app assistant is the one surface where a customer's words turn into writes on
-# their own data, and it reaches those writes over MCP with the user's access token. That
-# path crosses the frontend, Anthropic, the middleware MCP server and the database, and
-# nothing else in this suite touches it.
-#
-# It gates the plumbing and reads the database afterwards to see whether the write landed.
-# It does not grade the assistant: a model that answers badly is evals_tests.yml's problem.
+# The only surface where a customer's words become writes on their own data, over MCP with
+# their access token. Gates the plumbing, then reads the database to see if the write landed.
 
 # Did the model call something that should have written? Decides regression vs bad day
 # when the record is unchanged, so it is worth a selftest.
