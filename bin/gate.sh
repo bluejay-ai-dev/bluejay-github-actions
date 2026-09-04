@@ -8,7 +8,7 @@ set -euo pipefail
 
 ORG=${ORG:-bluejay-ai-dev}
 # Deploy order: whoever tolerates the other being old goes first. Frontend last.
-ORDER=${ORDER:-"bluejay_middleware livekit_agent text_agent evals docs bluejay_frontend_v2"}
+ORDER=${ORDER:-"bluejay_middleware livekit_agent text_agent evals emails-lambda docs bluejay_frontend_v2"}
 
 CACHE=${CACHE:-$(mktemp -d)}
 # Search tokenizes on the hyphen, so always re-filter titles ourselves.

@@ -9,7 +9,7 @@ on:
         description: 'Ticket id, e.g. ENG-123'
         required: true
       order:
-        description: 'Deploy order, e.g. "bluejay_middleware livekit_agent+text_agent bluejay_frontend_v2". Blank uses each repo .release/order.yml'
+        description: 'Deploy order using short names, e.g. "mw lk+tx fe". Blank uses each repo .release/order.yml. Names: mw fe lk tx ev ld em ga local docs'
         required: false
         default: ''
       check_only:

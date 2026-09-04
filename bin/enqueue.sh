@@ -4,11 +4,12 @@
 #   enqueue.sh run <ENG-123> [order]     merge the batch
 #   enqueue.sh check <ENG-123> [order]   what it would do, no writes
 #   enqueue.sh tiers <ENG-123> [order]   just the resolved order
+#   enqueue.sh aliases                   short names for the order field
 #
 # order overrides .release/order.yml for this run. The list IS the order: each entry waits
-# for the one before it. Join with + to send several together:
-#   "bluejay_middleware livekit_agent+text_agent bluejay_frontend_v2"
-# Merging is what triggers the deploy, so this is the deploy order too.
+# for the one before it. Join with + to send several together, and use the short names:
+#   "mw lk+tx fe"     is middleware, then livekit and text agent together, then frontend
+# `enqueue.sh aliases` prints them. Merging triggers the deploy, so this is deploy order.
 #
 # Exit: 0 merged | 1 batch not ready | 2 usage | 3 a merge failed and was reverted
 #
@@ -19,6 +20,37 @@ ORG=${ORG:-bluejay-ai-dev}
 HERE=$(cd "$(dirname "$0")" && pwd)
 DEPLOY_TIMEOUT=${DEPLOY_TIMEOUT:-900}
 NO_SIGNAL_OK=${NO_SIGNAL_OK:-90}
+
+# Short names, so nobody types bluejay_frontend_v2 into a form. Same prefixes we already
+# use posting PRs to #pr-reviews.
+alias_for() {
+  case "$1" in
+    mw)     echo bluejay_middleware ;;
+    fe)     echo bluejay_frontend_v2 ;;
+    lk)     echo livekit_agent ;;
+    tx)     echo text_agent ;;
+    ev)     echo evals ;;
+    ld)     echo livekit_dispatcher ;;
+    em)     echo emails-lambda ;;
+    ga)     echo bluejay-github-actions ;;
+    local)  echo bluejay-local ;;
+    docs)   echo docs ;;
+    *)      echo "$1" ;;
+  esac
+}
+expand_order() { # rewrite short names, keep + and spacing
+  local out="" tok part first
+  for tok in $1; do
+    part=""; first=1
+    while IFS= read -r x; do
+      [ -n "$x" ] || continue
+      [ "$first" = 1 ] && part="$(alias_for "$x")" || part="$part+$(alias_for "$x")"
+      first=0
+    done < <(tr '+' '\n' <<<"$tok")
+    out="$out $part"
+  done
+  printf '%s' "${out# }"
+}
 
 say()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
@@ -111,6 +143,7 @@ tiers_for() { # <ticket> [override]
     ORG="$ORG" "$HERE/gate.sh" order "$id"
     return
   fi
+  override=$(expand_order "$override")
   repos=$(open_prs "$id" | cut -f1 | sort -u)
   named=$(tr '+' ' ' <<<"$override" | tr -s ' ' '\n' | sed '/^$/d' | sort -u)
   # A typo here would silently drop a repo out of the batch, so refuse instead.
@@ -176,6 +209,7 @@ cmd_run() {
 case "${1:-}" in
   run)   shift; cmd_run "$@" ;;
   tiers) shift; tiers_for "$@" ;;
+  aliases) for a in mw fe lk tx ev ld em ga local docs; do printf '  %-6s %s\n' "$a" "$(alias_for "$a")"; done ;;
   check) shift; cmd_check "$@" ;;
   *) sed -n '2,6p' "$0"; exit 2 ;;
 esac
