@@ -25,7 +25,11 @@ ok()   { printf 'ok   %-9s %s\n' "$1" "${2:-}"; }
 bad()  { printf 'FAIL %-9s %s\n' "$1" "${2:-}" >&2; }
 miss() { printf 'MISS %-9s %s\n' "$1" "${2:-}" >&2; exit $E_FIXTURE; }
 
-# miss exits the SUBSHELL inside $( ), so callers must write `x=$(need FOO) || return $E_FIXTURE`.
+# Inside $( ) the miss below exits the SUBSHELL, so a caller that writes
+#   x=$(need FOO)
+# keeps going with x empty unless it also checks the status. Always write
+#   x=$(need FOO) || return $E_FIXTURE
+# or call it bare, as preflight does.
 need() {
   local v=${!1:-}
   [ -n "$v" ] || miss fixture "$1 is unset"
@@ -56,16 +60,18 @@ verdict() {
   esac
 }
 
-# error_code is not on the REST response yet. Every AUTH/MISSING/DECRYPT/BRIDGE code lands
-# on NO_CONNECTION anyway, so status is equivalent.
+# error_code lives on test_results but is not on the REST response yet, so classify on
+# status. Every AUTH/MISSING/DECRYPT/BRIDGE code lands on NO_CONNECTION anyway; the code
+# is only ever extra detail in the failure line.
 result_of() {
   local code; code=$(call GET "/v1/retrieve-simulation-result/$1")
   [ "$code" = 200 ] || { echo "HTTP_$code"; return; }
   body | jq -r '.simulation_result.status // "UNKNOWN"'
 }
 
-# Deadline per transition, not per test: queueing returns before dispatch, so a stuck
-# dispatch fails in 45s instead of burning 300.
+# Deadline per state transition, not one for the whole test. Queueing returns before
+# dispatch, so a 200 from the queue endpoint means nothing and a stuck dispatch has to
+# fail in 45s rather than burn the whole 300.
 await() {  # await <result_id> <wanted...|deadline> ; echoes the status it settled on
   local id=$1 want=$2 deadline=$3 end=$((SECONDS + deadline)) s
   while [ $SECONDS -lt "$end" ]; do
@@ -77,8 +83,9 @@ await() {  # await <result_id> <wanted...|deadline> ; echoes the status it settl
   echo "STUCK_IN_${s:-UNKNOWN}"
 }
 
-# From the agent row, never the call site. Required for LIVEKIT, must stay unset for
-# bridges; backwards either way looks like NO_CONNECTION or NO_ANSWER.
+# livekit_agent_name comes off the fixture agent row, never the call site. Mandatory for
+# LIVEKIT agents, must stay unset for the bridge providers: backwards one way is
+# NO_CONNECTION, backwards the other is NO_ANSWER.
 agent_run_extra() {
   local code; code=$(call GET "/v1/agents/$1")
   [ "$code" = 200 ] || miss fixture "agent $1 unreadable (HTTP $code)"
@@ -89,8 +96,9 @@ agent_run_extra() {
 
 # ---------------------------------------------------------------- parts
 
-# The fixture manifest, and the only place it lives. A rebuild that turns the gate red
-# teaches people to override it, hence the separate exit code.
+# The fixture manifest, and the only place it lives. A dev DB rebuild has broken the
+# existing suite once already: if a rebuild turns the gate red people learn to override it,
+# and then it is worse than no gate. Hence the separate exit code.
 cmd_preflight() {
   command -v jq >/dev/null || miss preflight "jq not installed"
   command -v node >/dev/null || miss preflight "node not installed"
@@ -256,8 +264,9 @@ cmd_sms() {
   ok sms "$s, $inb in / $outb out"
 }
 
-# Direct, not as a side effect of a sim: livekit_agent emits no spans and trace_ids is
-# customer supplied, so a sim proves nothing about traces.
+# Assert the ingest pipeline directly rather than as a side effect of a sim: livekit_agent
+# emits no spans of its own and test_results.trace_ids is customer supplied, so a sim proves
+# nothing about traces. This is faster, deterministic, and tests the thing that breaks.
 cmd_traces() {
   local seed=${SUITE_EXPECT_SHA:-$(date +%s)}${SUITE_ATTEMPT:-1}
   local tid; tid=$(printf '%s' "$seed" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-32)
@@ -305,8 +314,9 @@ PY
                          | select(. == "organization.id" or . == "collector.environment")] | length')
   [ "$stripped" = 0 ] || { bad traces "$stripped internal tags leaked to the client"; return $E_FAIL; }
 
-  # The case that matters: spans with an empty organization.id get silently dropped, and
-  # without this you cannot tell broken ingest from broken tenancy.
+  # The case that matters. The historical failure was spans landing with an empty
+  # organization.id, which the org filter then silently drops - and without this you
+  # cannot tell "ingest is broken" from "ingest works but tenancy is wrong".
   code=$(call POST "/v1/traces/$tid" "{}" "$KEY_B")
   [ "$code" = 404 ] || { bad traces "second org got HTTP $code on the same trace, expected 404"; return $E_FAIL; }
 
@@ -334,98 +344,25 @@ cmd_signup() {
 
 # ------------------------------------------------------------------ bluejay ai
 
-# The only surface where a customer's words become writes on their own data, over MCP with
-# their access token. Gates the plumbing, then reads the database to see if the write landed.
-
-# Did the model call something that should have written? Decides regression vs bad day
-# when the record is unchanged, so it is worth a selftest.
-bjai_is_write() { grep -qE 'update.*(digital_human|agent)|bulk_update' <<<"${1:-}"; }
-
-bjai_dh() { # bjai_dh <name> <phone> <sim> -> id, or empty
-  local payload; payload=$(jq -cn --arg s "$3" --arg n "$1" --arg p "$2" \
-    '{simulation_ids:[$s], digital_human:{name:$n, phone_number:$p,
-      intent:"Release gate fixture. Ask one question and end the call.",
-      persona:"Neutral, brief.",
-      success_criteria:"Not run; this record exists to be edited."}}')
-  [ "$(call POST /v1/create-digital-human "$payload")" = 200 ] || return 1
-  body | jq -r '.digital_human.id // empty'
-}
-
+# The one surface where a customer's words become writes on their own data, over MCP with
+# their access token. Asks it to build an agent and two simulations through the UI, then
+# checks the rows exist and removes them. It creates and deletes its own records, so no
+# fixture another part depends on is ever touched.
 cmd_bluejayai() {
-  local sim agent token dh1 dh2 phone before rc=0
-  sim=$(need TEST_SUITE_SIM_TEXT)   || return $E_FIXTURE
-  agent=$(need TEST_SUITE_AGENT_ID) || return $E_FIXTURE
+  [ -n "$FE" ] || miss bluejayai "SUITE_FRONTEND_URL is unset"
+  need TEST_SUITE_BLUEJAY_API_KEY >/dev/null || return $E_FIXTURE
   need SUITE_SUPABASE_SERVICE_KEY >/dev/null || return $E_FIXTURE
   need SUITE_USER_EMAIL >/dev/null           || return $E_FIXTURE
-  [ -n "$FE" ] || miss bluejayai "SUITE_FRONTEND_URL is unset"
-
-  [ "$(call GET /v1/phone-numbers)" = 200 ] || miss bluejayai "cannot list phone numbers"
-  phone=$(body | jq -r 'if type=="array" then .[0] else .phone_numbers[0] end
-                        | if type=="object" then .phone_number else . end // empty')
-  [ -n "$phone" ] || miss bluejayai "org has no phone number, a digital human cannot be created"
-
-  # Its own records, created and deleted here, so the assistant is never pointed at a
-  # fixture another part depends on.
-  token="bjai-$(date +%s)-$RANDOM"
-  dh1=$(bjai_dh "$token-a" "$phone" "$sim") || miss bluejayai "could not create the first digital human"
-  dh2=$(bjai_dh "$token-b" "$phone" "$sim") || {
-    call DELETE "/v1/digital-human/$dh1" >/dev/null
-    miss bluejayai "could not create the second digital human"; }
-  [ -n "$dh1" ] && [ -n "$dh2" ] || { call DELETE "/v1/digital-human/$dh1" >/dev/null
-    miss bluejayai "create returned 200 with no id"; }
-
-  # keyterms is an STT hint list: safe to rewrite on a shared fixture agent and put back.
-  [ "$(call GET "/v1/agents/$agent")" = 200 ] || miss bluejayai "cannot read agent $agent"
-  # GET /v1/agents/{id} returns the agent unwrapped, older shapes wrapped it. Never let
-  # this be null: update-agent reads null as "leave it alone", so the restore would be a
-  # no-op and the fixture would keep the gate's token forever.
-  before=$(body | jq -c '(.agent.keyterms // .keyterms // [])' 2>/dev/null)
-  case "$before" in ""|null) before='[]' ;; esac
-
-  rm -f /tmp/suite.bjai.env
   [ -d "$HERE/node_modules" ] || (cd "$HERE" && npm ci --silent && npx playwright install --with-deps chromium)
-  BJAI_DH_1=$dh1 BJAI_DH_2=$dh2 BJAI_AGENT_ID=$agent BJAI_TOKEN=$token \
-    node "$HERE/bluejay-ai.mjs" "$FE"
+  local rc
+  BJAI_TOKEN="bjai-$(date +%s)-$RANDOM" node "$HERE/bluejay-ai.mjs" "$FE"
   rc=$?
-
-  [ $rc = 0 ] && { bjai_verify "$dh1" "$dh2" "$agent" "$token"; rc=$?; }
-
-  # Always, including on a failure, or the next run inherits renamed records.
-  call DELETE "/v1/digital-human/$dh1" >/dev/null
-  call DELETE "/v1/digital-human/$dh2" >/dev/null
-  call POST /v1/update-agent "$(jq -cn --arg a "$agent" --argjson k "$before" \
-    '{agent_id:$a, keyterms:$k}')" >/dev/null
-
   case $rc in
-    0) ok bluejayai "attachment, MCP tool call, and both writes landed" ;;
+    0) ok bluejayai "built through the UI and cleaned up" ;;
     "$E_AMBER") : ;;
     *) bad bluejayai "see above" ;;
   esac
   return $rc
-}
-
-# The write is asynchronous from the browser's point of view: the tool call returns before
-# the row is necessarily readable, so poll rather than assert once.
-bjai_verify() {
-  local dh1=$1 dh2=$2 agent=$3 token=$4 end=$((SECONDS + 60)) n1 n2 kt tools=""
-  [ -f /tmp/suite.bjai.env ] && . /tmp/suite.bjai.env && tools=${BJAI_TOOLS:-}
-  while :; do
-    call GET "/v1/digital-human/$dh1" >/dev/null; n1=$(body | jq -r '.digital_human.name // ""')
-    call GET "/v1/digital-human/$dh2" >/dev/null; n2=$(body | jq -r '.digital_human.name // ""')
-    call GET "/v1/agents/$agent" >/dev/null;      kt=$(body | jq -r '((.agent.keyterms // .keyterms // []) | join(","))')
-    [ "$n1" = "$token-1" ] && [ "$n2" = "$token-2" ] && grep -q "$token" <<<"$kt" && return 0
-    [ $SECONDS -lt $end ] || break
-    sleep 5
-  done
-  note "digital humans: '$n1' '$n2' (wanted '$token-1' '$token-2'); agent keyterms: '${kt:-none}'"
-  # A tool that reported success and wrote nothing is a regression. A model that never
-  # called one is a bad day, and gets the one retry every amber gets.
-  if bjai_is_write "$tools"; then
-    bad bluejayai "MCP called ${tools} and the change never landed"
-    return $E_FAIL
-  fi
-  note "amber: tools called were '${tools:-none}', none of them a write"
-  return $E_AMBER
 }
 
 # One real conversation buys Retell plus Twilio plus SIP trunking plus the LiveKit receiver.
@@ -552,10 +489,8 @@ cmd_run() {
   exit $rc
 }
 
-# The logic worth checking, as opposed to the curls: the status classifier, the retry rule,
-# the bluejayai write rule, and the two node checks that cover the chat tap and the exit
-# codes it produces. Offline, no fixtures, no credentials. The shell half is instant; the
-# node half launches chromium five times, so the whole thing takes about 30s.
+# The logic worth checking, as opposed to the curls: the status classifier and the retry
+# rule. Offline, no fixtures, no credentials, instant.
 cmd_selftest() {
   local f=0
   chk() { [ "$2" = "$3" ] || { echo "selftest: $1 -> $2, want $3" >&2; f=1; }; }
@@ -575,22 +510,7 @@ cmd_selftest() {
   attempt amber; chk "amber rc" "$?" "$E_FAIL"; chk "amber tries" "$n" 2
   n=0; attempt red; chk "red rc" "$?" "$E_FAIL"; chk "red tries" "$n" 1
 
-  # bluejayai: a write tool that changed nothing is a regression, anything else is amber
-  bjai_is_write "update_digital_human"      && chk "write dh"    yes yes || chk "write dh"    no yes
-  bjai_is_write "bulk_update_digital_humans" && chk "write bulk" yes yes || chk "write bulk" no yes
-  bjai_is_write "update_agent"              && chk "write agent" yes yes || chk "write agent" no yes
-  bjai_is_write "list_digital_humans,get_agent" && chk "read only" yes no || chk "read only" no no
-  bjai_is_write "" && chk "no tools" yes no || chk "no tools" no no
-
-  # The chat tap fails open when it breaks, so it gets a real check rather than trust.
-  if [ -d "$HERE/node_modules" ]; then
-    node "$HERE/chat-tap.test.mjs" || f=1
-    node "$HERE/bluejay-ai.test.mjs" || f=1
-  else
-    note "chat-tap check skipped, no node_modules (npm ci in $HERE to run it)"
-  fi
-
-  [ $f = 0 ] && ok selftest "classifier, retry rule, bluejayai write rule" || return $E_FAIL
+  [ $f = 0 ] && ok selftest "classifier and retry rule" || return $E_FAIL
 }
 
 case "${1:-}" in

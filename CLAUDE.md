@@ -33,7 +33,7 @@ manifest and nothing external in the merge path.
 | `bin/suite.sh` | the integration suite, one subcommand per part |
 | `bin/notify.sh` | DMs the authors on a ticket and moves it to Needs Prod Testing |
 | `bin/people.tsv` | github login to slack user id; a missing row falls back to the channel |
-| `bin/*.mjs` | playwright walks and their stub-server tests |
+| `bin/*.mjs` | playwright walks |
 
 ## Things that will bite you
 
