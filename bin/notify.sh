@@ -66,8 +66,31 @@ linear_state() { # <ticket> <state id>
     || warn "linear did not move $1: $(jq -c '.errors[0].message // .' <<<"$r" 2>/dev/null)"
 }
 
-msg_merged()      { printf '%s shipped. %s is on main and deploying.\nMoved to Needs Prod Testing, so check it on prod and close it out.' "$1" "$2"; }
-msg_kicked_back() { printf '%s was kicked back before anything merged.\n%s\nNothing landed, so fix it and run enqueue again.' "$1" "$2"; }
+# Any state, because by the time this runs the PRs are merged and closed.
+prs_for() { # <ticket> -> "<repo>#<num> <url>" per line
+  gh search prs --owner "$ORG" --match title "$1" --limit 50 --json repository,number,title,url \
+    -q ".[] | select(.title | test(\"\\\\b$1\\\\b\")) | \"\(.repository.name)#\(.number) \(.url)\"" 2>/dev/null | sort
+}
+
+links_for() { # <ticket> -> indented list, empty when the search fails
+  local out; out=$(prs_for "$1")
+  [ -n "$out" ] || return 0
+  printf '\n'; while read -r ref url; do printf '  %s  %s\n' "$ref" "$url"; done <<<"$out"
+}
+
+run_link() {
+  [ -n "${GITHUB_RUN_ID:-}" ] || return 0
+  printf '\n%s/%s/actions/runs/%s' "${GITHUB_SERVER_URL:-https://github.com}" "${GITHUB_REPOSITORY:-}" "$GITHUB_RUN_ID"
+}
+
+msg_merged() {
+  printf '%s shipped. %s is on main and deploying.\nMoved to Needs Prod Testing, so check it on prod and close it out.\n%s' \
+    "$1" "$2" "$(links_for "$1")"
+}
+msg_kicked_back() {
+  printf '%s was kicked back before anything merged.\n%s\nNothing landed, so fix it and run enqueue again.\n%s%s' \
+    "$1" "$2" "$(links_for "$1")" "$(run_link)"
+}
 
 case "${1:-}" in
   merged)
