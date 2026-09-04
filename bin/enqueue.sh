@@ -91,8 +91,18 @@ ready() { # <ticket> -> 0 when every sibling can merge
   return $bad
 }
 
-# Poll by sha. No signal at all is a warning, not a pass: a repo with no deploy is normal,
-# a repo whose deploy never starts is not, and the two look identical for the first minute.
+# Some repos never deploy: docs publishes through Mintlify and has no workflows at all,
+# and most of the org is the same. Waiting on a signal that cannot arrive costs every batch
+# the grace period and teaches people that a skipped wait is normal.
+deploys() { # <repo> -> 0 when this repo is expected to produce a deploy signal
+  local v
+  v=$(gh api "repos/$ORG/$1/contents/.release/order.yml" --jq .content 2>/dev/null \
+      | base64 -d 2>/dev/null | sed -n 's/^deploys:[[:space:]]*//p' | tr -d '[:space:]')
+  [ "$v" != false ]
+}
+
+# Poll by sha. No signal is a warning, not a pass: a repo whose deploy never starts looks
+# identical to one that has none for the first minute, which is what `deploys` settles.
 wait_deploy() { # <repo> <sha>
   local repo=$1 sha=$2 end=$((SECONDS + DEPLOY_TIMEOUT)) seen=0 st
   while [ $SECONDS -lt "$end" ]; do
@@ -199,7 +209,11 @@ cmd_run() {
     for repo in $tier; do
       grep -q "^$repo:" <<<"$(printf '%s\n' "${landed[@]}")" || continue
       sha=$(printf '%s\n' "${landed[@]}" | awk -F: -v r="$repo" '$1==r{print $2}' | tail -1)
-      wait_deploy "$repo" "$sha" || { rollback "${landed[@]}"; exit 3; }
+      if deploys "$repo"; then
+        wait_deploy "$repo" "$sha" || { rollback "${landed[@]}"; exit 3; }
+      else
+        say "  $repo does not deploy, not waiting"
+      fi
     done
   done < <(tiers_for "$id" "${2:-}")
 
