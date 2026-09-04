@@ -49,6 +49,9 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           ORG: ${{ github.repository_owner }}
           CHECK_ONLY: ${{ inputs.check_only }}
+          # Set once a batch environment exists; until then enqueue merges on PR checks.
+          SUITE_URL: ${{ vars.QUEUE_SUITE_URL }}
+          SUITE_API_URL: ${{ vars.QUEUE_SUITE_API_URL }}
         run: |
           if [ "$CHECK_ONLY" = "true" ]; then
             bin/enqueue.sh check "$TICKET" | tee /tmp/enqueue.log

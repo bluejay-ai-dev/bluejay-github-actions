@@ -110,6 +110,17 @@ cmd_run() {
   say "batch $id"
   ready "$id" || die "batch is not ready, nothing merged"
 
+  # The design says a batch is proved against an environment before it merges. That
+  # environment does not exist yet (previews moved to full stacks, blocked on the CI IAM
+  # role), so this is opt-in rather than pretended: set SUITE_URL and it runs, leave it
+  # unset and enqueue merges on the PR checks alone and says so.
+  if [ -n "${SUITE_URL:-}" ]; then
+    say "proving the batch against $SUITE_URL"
+    "$HERE/suite.sh" run "$SUITE_URL" "${SUITE_API_URL:-}" || die "suite failed, nothing merged"
+  else
+    say "no SUITE_URL: merging on PR checks alone, the batch is not proved against an environment"
+  fi
+
   local -a landed=()
   local tier repo num sha
   while read -r tier; do
