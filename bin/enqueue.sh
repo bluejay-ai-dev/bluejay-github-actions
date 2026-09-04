@@ -184,7 +184,9 @@ cmd_run() {
   # unset and enqueue merges on the PR checks alone and says so.
   if [ -n "${SUITE_URL:-}" ]; then
     say "proving the batch against $SUITE_URL"
-    "$HERE/suite.sh" run "$SUITE_URL" "${SUITE_API_URL:-}" || die "suite failed, nothing merged"
+    "$HERE/suite.sh" run "$SUITE_URL" "${SUITE_API_URL:-}" || {
+      "$HERE/notify.sh" kicked-back "$id" "the suite failed against $SUITE_URL" || true
+      die "suite failed, nothing merged"; }
   else
     say "no SUITE_URL: merging on PR checks alone, the batch is not proved against an environment"
   fi
@@ -200,6 +202,7 @@ cmd_run() {
       if ! gh pr merge "$num" -R "$ORG/$repo" --squash --delete-branch >/dev/null 2>&1; then
         warn "  $repo#$num FAILED to merge"
         rollback "${landed[@]}"
+        "$HERE/notify.sh" kicked-back "$id" "$repo#$num would not merge; anything already landed was reverted" || true
         exit 3
       fi
       sha=$(gh api "repos/$ORG/$repo/commits/main" -q .sha 2>/dev/null)
@@ -210,7 +213,10 @@ cmd_run() {
       grep -q "^$repo:" <<<"$(printf '%s\n' "${landed[@]}")" || continue
       sha=$(printf '%s\n' "${landed[@]}" | awk -F: -v r="$repo" '$1==r{print $2}' | tail -1)
       if deploys "$repo"; then
-        wait_deploy "$repo" "$sha" || { rollback "${landed[@]}"; exit 3; }
+        wait_deploy "$repo" "$sha" || {
+          rollback "${landed[@]}"
+          "$HERE/notify.sh" kicked-back "$id" "$repo did not deploy cleanly; the batch was reverted" || true
+          exit 3; }
       else
         say "  $repo does not deploy, not waiting"
       fi
@@ -218,6 +224,9 @@ cmd_run() {
   done < <(tiers_for "$id" "${2:-}")
 
   say "batch $id merged: ${#landed[@]} repo(s)"
+  # Told last, and never fatal: the batch has merged either way, and failing the run
+  # because Slack was down would misreport what happened.
+  "$HERE/notify.sh" merged "$id" "$(printf '%s ' "${landed[@]%%:*}")" || true
 }
 
 case "${1:-}" in

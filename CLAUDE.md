@@ -31,6 +31,8 @@ manifest and nothing external in the merge path.
 | `bin/gate.sh` | siblings, closure, and `order` (merge tiers from `.release/order.yml`) |
 | `bin/enqueue.sh` | readiness, tier ordering, squash merge, deploy waits, rollback |
 | `bin/suite.sh` | the integration suite, one subcommand per part |
+| `bin/notify.sh` | DMs the authors on a ticket and moves it to Needs Prod Testing |
+| `bin/people.tsv` | github login to slack user id; a missing row falls back to the channel |
 | `bin/*.mjs` | playwright walks and their stub-server tests |
 
 ## Things that will bite you
