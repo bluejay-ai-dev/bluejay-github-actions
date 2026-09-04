@@ -75,7 +75,7 @@ prs_for() { # <ticket> -> "<repo>#<num> <url>" per line
 links_for() { # <ticket> -> indented list, empty when the search fails
   local out; out=$(prs_for "$1")
   [ -n "$out" ] || return 0
-  printf '\n'; while read -r ref url; do printf '  %s  %s\n' "$ref" "$url"; done <<<"$out"
+  printf '\n\n'; while read -r ref url; do printf '%s\n' "$url"; done <<<"$out"
 }
 
 run_link() {
@@ -84,12 +84,11 @@ run_link() {
 }
 
 msg_merged() {
-  printf '%s shipped. %s is on main and deploying.\nMoved to Needs Prod Testing, so check it on prod and close it out.\n%s' \
-    "$1" "$2" "$(links_for "$1")"
+  printf ':white_check_mark: %s shipped, please test in production https://app.getbluejay.ai\n%s' \
+    "$1" "$(links_for "$1")"
 }
 msg_kicked_back() {
-  printf '%s was kicked back before anything merged.\n%s\nNothing landed, so fix it and run enqueue again.\n%s%s' \
-    "$1" "$2" "$(links_for "$1")" "$(run_link)"
+  printf ':x: %s kicked back\n%s' "$1" "$(links_for "$1")"
 }
 
 case "${1:-}" in
