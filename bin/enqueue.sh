@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Merge every PR on a ticket, in dependency order, or none of them.
 #
-#   enqueue.sh run <ENG-123>     merge the batch
-#   enqueue.sh check <ENG-123>   what it would do, no writes
+#   enqueue.sh run <ENG-123> [order]     merge the batch
+#   enqueue.sh check <ENG-123> [order]   what it would do, no writes
+#   enqueue.sh tiers <ENG-123> [order]   just the resolved order
+#
+# order overrides .release/order.yml for this run. The list IS the order: each entry waits
+# for the one before it. Join with + to send several together:
+#   "bluejay_middleware livekit_agent+text_agent bluejay_frontend_v2"
+# Merging is what triggers the deploy, so this is the deploy order too.
 #
 # Exit: 0 merged | 1 batch not ready | 2 usage | 3 a merge failed and was reverted
 #
@@ -97,16 +103,35 @@ rollback() { # <"repo:sha" ...>
   done
 }
 
+# Declared order unless the caller named one. An override is echoed in full so the run
+# log says which order was used, rather than leaving it to whoever reads it later.
+tiers_for() { # <ticket> [override]
+  local id=$1 override=${2:-} repos named missing t
+  if [ -z "$override" ]; then
+    ORG="$ORG" "$HERE/gate.sh" order "$id"
+    return
+  fi
+  repos=$(open_prs "$id" | cut -f1 | sort -u)
+  named=$(tr '+' ' ' <<<"$override" | tr -s ' ' '\n' | sed '/^$/d' | sort -u)
+  # A typo here would silently drop a repo out of the batch, so refuse instead.
+  for t in $named; do
+    grep -qx "$t" <<<"$repos" || { warn "override names $t, which has no open PR on $id"; return 1; }
+  done
+  missing=$(comm -23 <(printf '%s\n' $repos) <(printf '%s\n' $named))
+  [ -z "$missing" ] || { warn "override leaves out: $(tr '\n' ' ' <<<"$missing")"; return 1; }
+  tr -s ' ' '\n' <<<"$override" | sed '/^$/d' | tr '+' ' '
+}
+
 cmd_check() {
-  local id=${1:-}; [ -n "$id" ] || { warn "usage: enqueue.sh check <ENG-123>"; exit 2; }
+  local id=${1:-}; [ -n "$id" ] || { warn "usage: enqueue.sh check <ENG-123> [order]"; exit 2; }
   say "batch $id"
   ready "$id" || die "batch is not ready"
-  say "merge order:"
-  ORG="$ORG" "$HERE/gate.sh" order "$id" | nl -ba -w4 -s'  '
+  say "merge and deploy order${2:+ (overridden)}:"
+  tiers_for "$id" "${2:-}" | nl -ba -w4 -s'  ' || die "bad order"
 }
 
 cmd_run() {
-  local id=${1:-}; [ -n "$id" ] || { warn "usage: enqueue.sh run <ENG-123>"; exit 2; }
+  local id=${1:-}; [ -n "$id" ] || { warn "usage: enqueue.sh run <ENG-123> [order]"; exit 2; }
   say "batch $id"
   ready "$id" || die "batch is not ready, nothing merged"
 
@@ -143,13 +168,14 @@ cmd_run() {
       sha=$(printf '%s\n' "${landed[@]}" | awk -F: -v r="$repo" '$1==r{print $2}' | tail -1)
       wait_deploy "$repo" "$sha" || { rollback "${landed[@]}"; exit 3; }
     done
-  done < <(ORG="$ORG" "$HERE/gate.sh" order "$id")
+  done < <(tiers_for "$id" "${2:-}")
 
   say "batch $id merged: ${#landed[@]} repo(s)"
 }
 
 case "${1:-}" in
   run)   shift; cmd_run "$@" ;;
+  tiers) shift; tiers_for "$@" ;;
   check) shift; cmd_check "$@" ;;
   *) sed -n '2,6p' "$0"; exit 2 ;;
 esac

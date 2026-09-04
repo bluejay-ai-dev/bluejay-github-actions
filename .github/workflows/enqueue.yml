@@ -8,6 +8,10 @@ on:
       ticket:
         description: 'Ticket id, e.g. ENG-123'
         required: true
+      order:
+        description: 'Deploy order, e.g. "bluejay_middleware livekit_agent+text_agent bluejay_frontend_v2". Blank uses each repo .release/order.yml'
+        required: false
+        default: ''
       check_only:
         description: 'Report what would happen and merge nothing'
         type: boolean
@@ -31,10 +35,15 @@ jobs:
       - name: Validate the ticket
         env:
           TICKET: ${{ inputs.ticket }}
+          ORDER: ${{ inputs.order }}
         run: |
           # Caller input reaches gh and git below, so it is matched, never interpolated.
           [[ "$TICKET" =~ ^ENG-[0-9]+$ ]] || { echo "::error::not a ticket id: $TICKET"; exit 2; }
           echo "TICKET=$TICKET" >> "$GITHUB_ENV"
+          # Repo names, spaces and + only. enqueue.sh then refuses a typo or an omission.
+          [[ -z "$ORDER" || "$ORDER" =~ ^[A-Za-z0-9._+\ -]+$ ]] \
+            || { echo "::error::order may only contain repo names, spaces and +"; exit 2; }
+          echo "ORDER=$ORDER" >> "$GITHUB_ENV"
 
       # A token that can merge into protected main. The App is the only bypass actor.
       - uses: actions/create-github-app-token@v1
@@ -49,14 +58,11 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           ORG: ${{ github.repository_owner }}
           CHECK_ONLY: ${{ inputs.check_only }}
-          # Set once a batch environment exists; until then enqueue merges on PR checks.
-          SUITE_URL: ${{ vars.QUEUE_SUITE_URL }}
-          SUITE_API_URL: ${{ vars.QUEUE_SUITE_API_URL }}
         run: |
           if [ "$CHECK_ONLY" = "true" ]; then
-            bin/enqueue.sh check "$TICKET" | tee /tmp/enqueue.log
+            bin/enqueue.sh check "$TICKET" "$ORDER" | tee /tmp/enqueue.log
           else
-            bin/enqueue.sh run "$TICKET" | tee /tmp/enqueue.log
+            bin/enqueue.sh run "$TICKET" "$ORDER" | tee /tmp/enqueue.log
           fi
           exit ${PIPESTATUS[0]}
 
