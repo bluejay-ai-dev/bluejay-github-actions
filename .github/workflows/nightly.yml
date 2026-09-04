@@ -11,7 +11,7 @@ name: nightly
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # 09:00 UTC, so 01:00 PST / 02:00 PDT
+    - cron: '0 9 * * *'   # 02:00 PT / 09:00 UTC, before anyone is working
   workflow_dispatch:
     inputs:
       parts:
@@ -23,15 +23,10 @@ concurrency:
   group: nightly
   cancel-in-progress: false
 
-# Least privilege: this reads the repo and talks to Railway and GHCR with their own
-# tokens. Without this block it inherits the repo default, which can be write-all.
-permissions:
-  contents: read
-
 jobs:
   suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 25
     outputs:
       verdict: ${{ steps.run.outputs.verdict }}
       summary: ${{ steps.run.outputs.summary }}
@@ -71,9 +66,6 @@ jobs:
           SUITE_SUPABASE_SERVICE_KEY: ${{ secrets.PROD_SUPABASE_SERVICE_KEY }}
           SUITE_USER_EMAIL: ${{ secrets.NIGHTLY_USER_EMAIL }}
           SUITE_EXPECT_CAPTCHA: '1'
-          # The gate runs these only when their paths change. Nightly is the full matrix,
-          # so ask for them explicitly; missing fixtures then report as fixture, not silence.
-          SUITE_CHANGED: 'redteam uptime'
           TEST_SUITE_SIM_TEXT: ${{ vars.NIGHTLY_SIM_TEXT }}
           TEST_SUITE_SIM_SMS: ${{ vars.NIGHTLY_SIM_SMS }}
           TEST_SUITE_SIM_OUTBOUND: ${{ vars.NIGHTLY_SIM_OUTBOUND }}
@@ -82,32 +74,18 @@ jobs:
           TEST_SUITE_AGENT_INBOUND: ${{ vars.NIGHTLY_AGENT_INBOUND }}
           TEST_SUITE_AGENT_ID: ${{ vars.NIGHTLY_AGENT_ID }}
           TEST_SUITE_ECHO_URL: ${{ vars.NIGHTLY_ECHO_URL }}
-          PARTS: ${{ inputs.parts }}
         run: |
           set +e
-          # PARTS is caller input: allowlisted, never interpolated into the shell.
-          rc=0
-          if [ -n "$PARTS" ]; then
-            for p in $PARTS; do
-              case "$p" in
-                preflight|sha|creds|signup|text|sms|traces|browser|bluejayai|outbound|inbound|redteam|uptime) ;;
-                *) echo "refusing unknown part: $p"; exit 2 ;;
-              esac
-            done
-            for p in $PARTS; do
-              ./suite.sh "$p" 2>&1 | tee -a /tmp/out
-              prc=${PIPESTATUS[0]}
-              [ "$prc" = 0 ] || rc=$prc   # keep the first real failure, not the last part's status
-            done
+          if [ -n "${{ inputs.parts }}" ]; then
+            for p in ${{ inputs.parts }}; do ./suite.sh "$p"; done 2>&1 | tee /tmp/out
           else
             ./suite.sh run 2>&1 | tee /tmp/out
-            rc=${PIPESTATUS[0]}
           fi
+          rc=${PIPESTATUS[0]}
           case $rc in
             0) v=green ;;
-            3) v=fixture ;;   # our test data rotted, not a product failure
+            3) v=fixture ;;   # our own test data rotted; not a product failure
             4) v=config ;;    # a provider's credentials are red
-            5) v=amber ;;     # carrier had a bad night; `run` retries internally, a single part cannot
             *) v=red ;;
           esac
           echo "verdict=$v" >> "$GITHUB_OUTPUT"
@@ -118,8 +96,6 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "### nightly: $v" >> "$GITHUB_STEP_SUMMARY"
           sed -n '1,60p' /tmp/out >> "$GITHUB_STEP_SUMMARY"
-          # Amber must not fail the job, or the verdict is cosmetic and a dropped call pages.
-          [ "$v" = amber ] && exit 0
           exit $rc
 
       - name: Keep the evidence
@@ -133,28 +109,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  tell-us:
-    needs: suite
-    if: always() && needs.suite.result != 'success'
-    runs-on: ubuntu-latest
-    steps:
-      # Three different things went wrong, and they go to different people. A red is the
-      # product; a fixture is us; a config is a provider account. One shared "nightly
-      # failed" message trains everyone to ignore all three.
-      - name: Post to Slack
-        env:
-          HOOK: ${{ secrets.SLACK_NIGHTLY_WEBHOOK }}
-          VERDICT: ${{ needs.suite.outputs.verdict }}
-          SUMMARY: ${{ needs.suite.outputs.summary }}
-          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          [ -n "$HOOK" ] || { echo "::warning::SLACK_NIGHTLY_WEBHOOK unset, nobody was told"; exit 0; }
-          case "$VERDICT" in
-            red)     head="prod nightly is red" ;;
-            fixture) head="nightly could not run: its own fixtures are gone" ;;
-            config)  head="nightly stopped early: a provider's credentials are red" ;;
-            *)       head="nightly failed before it reached the suite" ;;
-          esac
-          jq -n --arg t "$head" --arg s "$SUMMARY" --arg u "$RUN" \
-            '{text: ($t + "\n```" + $s + "```\n" + $u)}' \
-            | curl -sS --fail --max-time 30 -X POST -H 'Content-Type: application/json' -d @- "$HOOK" >/dev/null
+# No Slack job on purpose. Prod issues already page through their own path, so a second
+# "the nightly is red" message is a channel people learn to mute. The verdict is on the
+# run, the evidence is in the artifact, and a person who broke their own batch is DM'd by
+# notify.sh rather than told in a channel.

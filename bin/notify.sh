@@ -11,7 +11,9 @@ set -uo pipefail
 
 ORG=${ORG:-bluejay-ai-dev}
 HERE=$(cd "$(dirname "$0")" && pwd)
-CHANNEL=${SLACK_NIGHTLY_CHANNEL:-}
+# Optional. Only used to surface an author we have no Slack mapping for; prod health
+# pages through its own path and does not come here.
+CHANNEL=${SLACK_FALLBACK_CHANNEL:-}
 NEEDS_PROD_TESTING=e502e9ad-e870-4c68-9454-50bcfeb72451
 
 warn() { printf '%s\n' "$*" >&2; }
