@@ -3,6 +3,7 @@
 #   gate.sh siblings <repo> <pr>   PRs elsewhere sharing this PR's ticket
 #   gate.sh closure  <repo>        repos+tickets a dev->main promotion pulls in
 #   gate.sh page     [out.html]    what is sitting on dev, org-wide
+#   gate.sh order    <ticket>      merge tiers for a ticket, one tier per line
 set -euo pipefail
 
 ORG=${ORG:-bluejay-ai-dev}
@@ -100,9 +101,47 @@ cmd_page() {
   echo "$out"
 }
 
+# Tiers, not a flat list: repos in the same tier do not depend on each other, so
+# serialising them costs the sum of their deploys instead of the longest.
+cmd_order() {  # <ticket>
+  local id=$1 repos
+  repos=$(open_prs_for "$id" | cut -f1 | sort -u)
+  [ -n "$repos" ] || { echo "no open PRs carry $id" >&2; return 1; }
+  ORG="$ORG" python3 - $repos <<'EOF'
+import base64, json, subprocess, sys, os
+org, repos = os.environ["ORG"], sys.argv[1:]
+def after(repo):
+    # From the default branch, not the PR: a PR must not be able to reorder its own
+    # merge. ORDER_REF exists for testing and for the bootstrap, before it has landed.
+    ref = os.environ.get("ORDER_REF", "")
+    path = f"repos/{org}/{repo}/contents/.release/order.yml" + (f"?ref={ref}" if ref else "")
+    r = subprocess.run(["gh","api",path,"-q",".content"], capture_output=True, text=True)
+    if r.returncode:           # no order.yml: depends on nothing, goes first
+        return []
+    body = base64.b64decode(r.stdout.strip()).decode()
+    for line in body.splitlines():
+        if line.strip().startswith("after:"):
+            inner = line.split(":",1)[1].strip().strip("[]")
+            return [x.strip() for x in inner.split(",") if x.strip()]
+    return []
+# Only wait on repos actually in this batch. A dependency with no PR is already live.
+dep = {r: [d for d in after(r) if d in repos] for r in repos}
+done, tiers = set(), []
+while len(done) < len(repos):
+    tier = sorted(r for r in repos if r not in done and all(d in done for d in dep[r]))
+    if not tier:
+        print("cycle in .release/order.yml among: " +
+              " ".join(sorted(set(repos) - done)), file=sys.stderr)
+        sys.exit(1)
+    tiers.append(tier); done |= set(tier)
+for t in tiers: print(" ".join(t))
+EOF
+}
+
 case "${1:-}" in
+  order)    shift; cmd_order "$@" ;;
   siblings) shift; cmd_siblings "$@" ;;
   closure)  shift; cmd_closure "$@" ;;
   page)     shift; cmd_page "$@" ;;
-  *) sed -n '2,5p' "$0"; exit 1 ;;
+  *) sed -n '2,6p' "$0"; exit 1 ;;
 esac
