@@ -52,11 +52,14 @@ tell() { # <ticket> <text>
 
 linear_state() { # <ticket> <state id>
   [ -n "${LINEAR_API_KEY:-}" ] || { warn "LINEAR_API_KEY unset, ticket not moved"; return 0; }
-  local r
+  # The query lives in its own quoted variable. Inline, the shell brace-expands
+  # `{issueUpdate(id:$i,input:...)}` at the comma and runs jq twice on two half-programs.
+  local r q
+  q='mutation($i:String!,$s:String!){issueUpdate(id:$i,input:{stateId:$s}){success}}'
   r=$(curl -sS --max-time 20 https://api.linear.app/graphql \
     -H "Authorization: $LINEAR_API_KEY" -H 'content-type: application/json' \
-    -d "$(jq -nc --arg i "$1" --arg s "$2" \
-      '{query:"mutation($i:String!,$s:String!){issueUpdate(id:$i,input:{stateId:$s}){success}}",variables:{i:$i,s:$s}}')")
+    -d "$(jq -nc --arg q "$q" --arg i "$1" --arg s "$2" \
+      '{query:$q,variables:{i:$i,s:$s}}')")
   jq -e '.data.issueUpdate.success' <<<"$r" >/dev/null \
     || warn "linear did not move $1: $(jq -c '.errors[0].message // .' <<<"$r" 2>/dev/null)"
 }
