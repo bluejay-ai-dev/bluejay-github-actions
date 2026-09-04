@@ -1,0 +1,90 @@
+name: preview
+
+# One preview box per ticket, running only the repos that ticket changes. Manual only:
+# nothing spins up because someone pushed.
+# The path of this file is load-bearing. The bluejay-preview-ci trust policy conditions on
+# job_workflow_ref matching it, so renaming or moving it revokes the role.
+on:
+  workflow_dispatch:
+    inputs:
+      ticket:
+        description: 'Ticket id, e.g. ENG-123'
+        required: true
+      action:
+        description: 'up or down'
+        type: choice
+        options: [up, down]
+        default: up
+  workflow_call:
+    inputs:
+      ticket:
+        type: string
+        required: true
+      action:
+        type: string
+        default: up
+
+# One box per ticket, so two runs on the same ticket must not race for it.
+concurrency:
+  group: preview-${{ inputs.ticket }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the ticket
+        env:
+          TICKET: ${{ inputs.ticket }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          # Caller input reaches aws, gh and dns names below, so it is matched, never
+          # interpolated.
+          [[ "$TICKET" =~ ^ENG-[0-9]+$ ]] || { echo "::error::not a ticket id: $TICKET"; exit 2; }
+          [[ "$ACTION" =~ ^(up|down)$ ]] || { echo "::error::action must be up or down"; exit 2; }
+          echo "TICKET=$TICKET" >> "$GITHUB_ENV"
+          echo "ACTION=$ACTION" >> "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
+          aws-region: us-east-1
+
+      # Read-only, and only to find the PRs and clone them. A preview box is reachable by
+      # reviewers and owned by nobody, so nothing that can write reaches this job.
+      - uses: actions/create-github-app-token@v1
+        id: app
+        with:
+          app-id: ${{ vars.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+          permission-pull-requests: read
+
+      - name: Run
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          PREVIEW_DOMAIN: ${{ vars.PREVIEW_DOMAIN }}
+          PREVIEW_HOSTED_ZONE_ID: ${{ vars.PREVIEW_HOSTED_ZONE_ID }}
+          PREVIEW_SHARED_API_URL: ${{ vars.PREVIEW_SHARED_API_URL }}
+          PREVIEW_INFISICAL_PROJECT_ID: ${{ vars.PREVIEW_INFISICAL_PROJECT_ID }}
+          PREVIEW_INFISICAL_IDENTITY_ID: ${{ vars.PREVIEW_INFISICAL_IDENTITY_ID }}
+        run: bin/preview.sh "$ACTION" "$TICKET" | tee /tmp/preview.log
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### preview $ACTION $TICKET"
+            echo '```'
+            sed -n '1,40p' /tmp/preview.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
