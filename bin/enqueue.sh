@@ -139,8 +139,14 @@ rollback() { # <"repo:sha" ...>
     entry=${!i}; repo=${entry%%:*}; sha=${entry##*:}
     warn "reverting $repo $sha"
     local d; d=$(mktemp -d)
+    # A merge commit needs -m 1 and a squash must not have it. Measured across the org,
+    # roughly one merge in eight is still a merge commit, so assuming either way is wrong
+    # until squash-only is enforced. Ask the commit rather than guess.
+    local parents m=""
+    parents=$(gh api "repos/$ORG/$repo/commits/$sha" --jq '.parents | length' 2>/dev/null || echo 1)
+    [ "${parents:-1}" -gt 1 ] && m="-m 1"
     if git clone -q --depth 20 "https://x-access-token:${GH_TOKEN}@github.com/$ORG/$repo" "$d" 2>/dev/null \
-       && git -C "$d" revert --no-edit "$sha" >/dev/null 2>&1 \
+       && git -C "$d" revert --no-edit $m "$sha" >/dev/null 2>&1 \
        && git -C "$d" push -q origin HEAD:main 2>/dev/null; then
       say "  reverted $repo $sha"
       ROLLBACK_OK="$ROLLBACK_OK $repo"
