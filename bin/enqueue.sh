@@ -194,7 +194,7 @@ cmd_run() {
   if [ -n "${SUITE_URL:-}" ]; then
     say "proving the batch against $SUITE_URL"
     "$HERE/suite.sh" run "$SUITE_URL" "${SUITE_API_URL:-}" || {
-      STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "the suite failed against $SUITE_URL" || true
+      REVERTED="$ROLLBACK_OK" STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "the suite failed against $SUITE_URL" || true
       die "suite failed, nothing merged"; }
   else
     say "no SUITE_URL: merging on PR checks alone, the batch is not proved against an environment"
@@ -211,7 +211,7 @@ cmd_run() {
       if ! gh pr merge "$num" -R "$ORG/$repo" --squash --delete-branch >/dev/null 2>&1; then
         warn "  $repo#$num FAILED to merge"
         rollback "${landed[@]}"
-        STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo#$num would not merge; anything already landed was reverted" || true
+        REVERTED="$ROLLBACK_OK" STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo#$num would not merge; anything already landed was reverted" || true
         exit 3
       fi
       # The PR's own merge commit, never the tip of main. Anyone else landing in the
@@ -220,7 +220,7 @@ cmd_run() {
       [ -n "$sha" ] || {
         warn "  $repo#$num merged but its merge commit could not be read; refusing to continue blind"
         rollback "${landed[@]}"
-        STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo#$num merged but could not be recorded" || true
+        REVERTED="$ROLLBACK_OK" STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo#$num merged but could not be recorded" || true
         exit 3; }
       landed+=("$repo:$sha")
       say "  merged $repo#$num as $sha"
@@ -231,7 +231,7 @@ cmd_run() {
       if deploys "$repo"; then
         wait_deploy "$repo" "$sha" || {
           rollback "${landed[@]}"
-          STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo did not deploy cleanly; the batch was reverted" || true
+          REVERTED="$ROLLBACK_OK" STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo did not deploy cleanly; the batch was reverted" || true
           exit 3; }
       else
         say "  $repo does not deploy, not waiting"
