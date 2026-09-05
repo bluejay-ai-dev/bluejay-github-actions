@@ -128,8 +128,13 @@ wait_deploy() { # <repo> <sha>
 
 # Reverse order, and only what actually landed. A squash merge is one commit, so this is a
 # plain revert with no parent to guess at.
+# Reports per repo. A rollback that silently half-worked is the worst possible state to
+# leave main in, so both outcomes are stated.
+ROLLBACK_OK=""; ROLLBACK_FAILED=""
 rollback() { # <"repo:sha" ...>
   local entry repo sha i
+  ROLLBACK_OK=""; ROLLBACK_FAILED=""
+  [ "$#" -gt 0 ] || { say "nothing had landed, nothing to revert"; return 0; }
   for (( i=$#; i>0; i-- )); do
     entry=${!i}; repo=${entry%%:*}; sha=${entry##*:}
     warn "reverting $repo $sha"
@@ -137,12 +142,16 @@ rollback() { # <"repo:sha" ...>
     if git clone -q --depth 20 "https://x-access-token:${GH_TOKEN}@github.com/$ORG/$repo" "$d" 2>/dev/null \
        && git -C "$d" revert --no-edit "$sha" >/dev/null 2>&1 \
        && git -C "$d" push -q origin HEAD:main 2>/dev/null; then
-      warn "  reverted $repo"
+      say "  reverted $repo $sha"
+      ROLLBACK_OK="$ROLLBACK_OK $repo"
     else
       warn "  COULD NOT REVERT $repo $sha, main still carries it"
+      ROLLBACK_FAILED="$ROLLBACK_FAILED $repo"
     fi
     rm -rf "$d"
   done
+  [ -n "$ROLLBACK_FAILED" ] && warn "STILL ON MAIN:$ROLLBACK_FAILED"
+  return 0
 }
 
 # Declared order unless the caller named one. An override is echoed in full so the run
@@ -185,7 +194,7 @@ cmd_run() {
   if [ -n "${SUITE_URL:-}" ]; then
     say "proving the batch against $SUITE_URL"
     "$HERE/suite.sh" run "$SUITE_URL" "${SUITE_API_URL:-}" || {
-      "$HERE/notify.sh" kicked-back "$id" "the suite failed against $SUITE_URL" || true
+      STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "the suite failed against $SUITE_URL" || true
       die "suite failed, nothing merged"; }
   else
     say "no SUITE_URL: merging on PR checks alone, the batch is not proved against an environment"
@@ -202,10 +211,17 @@ cmd_run() {
       if ! gh pr merge "$num" -R "$ORG/$repo" --squash --delete-branch >/dev/null 2>&1; then
         warn "  $repo#$num FAILED to merge"
         rollback "${landed[@]}"
-        "$HERE/notify.sh" kicked-back "$id" "$repo#$num would not merge; anything already landed was reverted" || true
+        STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo#$num would not merge; anything already landed was reverted" || true
         exit 3
       fi
-      sha=$(gh api "repos/$ORG/$repo/commits/main" -q .sha 2>/dev/null)
+      # The PR's own merge commit, never the tip of main. Anyone else landing in the
+      # window between our merge and that read would put THEIR commit in the rollback list.
+      sha=$(gh pr view "$num" -R "$ORG/$repo" --json mergeCommit -q '.mergeCommit.oid // ""' 2>/dev/null)
+      [ -n "$sha" ] || {
+        warn "  $repo#$num merged but its merge commit could not be read; refusing to continue blind"
+        rollback "${landed[@]}"
+        STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo#$num merged but could not be recorded" || true
+        exit 3; }
       landed+=("$repo:$sha")
       say "  merged $repo#$num as $sha"
     done
@@ -215,7 +231,7 @@ cmd_run() {
       if deploys "$repo"; then
         wait_deploy "$repo" "$sha" || {
           rollback "${landed[@]}"
-          "$HERE/notify.sh" kicked-back "$id" "$repo did not deploy cleanly; the batch was reverted" || true
+          STILL_ON_MAIN="$ROLLBACK_FAILED" "$HERE/notify.sh" kicked-back "$id" "$repo did not deploy cleanly; the batch was reverted" || true
           exit 3; }
       else
         say "  $repo does not deploy, not waiting"

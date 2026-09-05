@@ -88,7 +88,10 @@ msg_merged() {
     "$1" "$(links_for "$1")"
 }
 msg_kicked_back() {
-  printf ':x: %s kicked back\n%s' "$1" "$(links_for "$1")"
+  # STILL_ON_MAIN breaks the terse format on purpose: a revert that failed means main is
+  # carrying code nobody signed off, and that must not be one line in a log somewhere.
+  printf ':x: %s kicked back%s\n%s' "$1" \
+    "${STILL_ON_MAIN:+ :rotating_light: could not revert:$STILL_ON_MAIN}" "$(links_for "$1")"
 }
 
 case "${1:-}" in
