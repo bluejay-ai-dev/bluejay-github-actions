@@ -25,6 +25,7 @@ const email = `gate+signup-${Date.now()}@${domain}`;
 const password = `Gate-${Math.random().toString(36).slice(2)}-${Date.now()}`;
 
 let userId = null;
+let hasCaptcha = false;
 const shot = "/tmp/suite-signup-fail.png";
 let browser = null, page = null;
 
@@ -55,7 +56,7 @@ const fail = async (m, code = 1) => {
   // The hidden response input, not the iframe: Turnstile renders the iframe lazily and
   // inside a shadow root, so an iframe selector reports "no captcha" on a page that
   // plainly has one. The input is injected whenever the widget is mounted.
-  const hasCaptcha = (await p.locator('input[name="cf-turnstile-response"]').count()) > 0;
+  hasCaptcha = (await p.locator('input[name="cf-turnstile-response"]').count()) > 0;
   if (!hasCaptcha && process.env.SUITE_EXPECT_CAPTCHA === "1")
     await fail("sign-up form rendered with no Turnstile widget, bot signups are open");
   await browser.close();
@@ -95,4 +96,7 @@ if (page.url() !== first && page.url().includes("/auth/"))
 await browser.close();
 browser = null; page = null;
 await deleteUser(userId);
-console.log(`ok signup: form renders with captcha, new account reaches ${first.replace(BASE, "") || "/"}`);
+// Say what was actually observed. Claiming "with captcha" when nothing checked for one
+// is the kind of green that reads as evidence and is not.
+console.log(`ok signup: form renders${hasCaptcha ? " with captcha" : " (no captcha on this deployment)"}` +
+  `, new account reaches ${first.replace(BASE, "") || "/"}`);

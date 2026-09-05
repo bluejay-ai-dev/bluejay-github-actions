@@ -52,6 +52,22 @@ await page.goto(`${BASE}/bluejay-ai`, { waitUntil: "domcontentloaded" });
 await page.waitForTimeout(7000);
 if (page.url().includes("/auth/")) await fail("bounced to login, session cookie rejected", 3);
 
+// A first visit puts a welcome tour over everything, and it swallows pointer events, so
+// nothing on the page is clickable until it is gone. A real user dismisses it too.
+for (let i = 0; i < 12; i++) {
+  const modal = page.locator("div.fixed.inset-0").first();
+  if (!(await modal.count())) break;
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(400);
+  if (!(await page.locator("div.fixed.inset-0").count())) break;
+  const next = modal.getByRole("button", { name: /next|done|finish|get started|skip/i }).first();
+  if (await next.count()) { await next.click({ force: true }).catch(() => {}); }
+  else { await modal.locator("button").first().click({ force: true }).catch(() => {}); }
+  await page.waitForTimeout(600);
+}
+if (await page.locator("div.fixed.inset-0").count())
+  await fail("a modal is covering the assistant and would not dismiss");
+
 // tiptap in some states, a plain textarea in others.
 const editor = page.locator(".ProseMirror").first();
 const textarea = page.getByPlaceholder(/Ask Bluejay/i).first();
@@ -64,8 +80,14 @@ const prompt =
   `Then create two simulations on that agent, named "${TOKEN}-a" and "${TOKEN}-b". ` +
   `Do not run them. Just create them and tell me when it is done.`;
 
-if (useEditor) { await editor.click(); await page.keyboard.type(prompt, { delay: 0 }); }
-else { await textarea.click(); await textarea.fill(prompt); }
+// Focus rather than click. A wrapper around the composer intercepts pointer events, so
+// clicking retries until it times out even though the editor is visible and enabled.
+if (useEditor) {
+  await editor.evaluate(el => el.focus());
+  await page.keyboard.insertText(prompt);
+} else {
+  await textarea.fill(prompt);
+}
 
 const send = page.locator('[data-tour-id="chat-send"]').first();
 if (!(await send.isEnabled().catch(() => false))) await fail("send button never became enabled");
@@ -92,7 +114,9 @@ if (!replied) await fail("the assistant page fell over while working");
 
 if (!agentId) {
   await browser.close().catch(() => {});
-  console.error(`AMBER bluejay-ai: replied but never created agent "${TOKEN}"`);
+  console.error(`AMBER bluejay-ai: replied but never created agent "${TOKEN}".`);
+  console.error(`  If this repeats, check MCP_SERVER_URL is publicly reachable: Anthropic`);
+  console.error(`  fetches it itself, and a dead tunnel leaves the model with no tools.`);
   process.exit(E_AMBER);
 }
 if (sims.length < 2) {
