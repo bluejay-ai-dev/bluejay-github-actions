@@ -1,8 +1,9 @@
 name: pr-checks
 
+# Reusable. App repos call it from their own thin wrapper, which is what keeps the
+# scripts in one place instead of copied into seven repos.
 on:
-  pull_request:
-    types: [opened, edited, synchronize, reopened, ready_for_review]
+  workflow_call:
 
 permissions:
   contents: read
@@ -105,8 +106,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: '[ -f Dockerfile ] && docker build -q -t check . || echo "no Dockerfile"'
-      - run: '[ -f package.json ] && npm ci && npm run build --if-present && npm test --if-present || echo "no package.json"'
+      - run: |
+          if [ -f Dockerfile ]; then docker build -q -t check .; else echo "no Dockerfile"; fi
+      - run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run build --if-present
+            npm test --if-present
+          else
+            echo "no package.json"
+          fi
 
   deterministic:
     runs-on: ubuntu-latest
