@@ -1,0 +1,60 @@
+name: hotfix
+
+# One PR, straight to main, no batch and no siblings. For production incidents only.
+# Everything else goes through enqueue so the repos land in a runnable order.
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'Repository name, e.g. bluejay_middleware'
+        required: true
+      pr:
+        description: 'PR number'
+        required: true
+      reason:
+        description: 'What is broken in production'
+        required: true
+
+concurrency:
+  group: enqueue      # shares the queue's lock: a hotfix must not race a batch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Validate
+        env:
+          REPO: ${{ inputs.repo }}
+          PR: ${{ inputs.pr }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          [[ "$REPO" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad repo"; exit 2; }
+          [[ "$PR"   =~ ^[0-9]+$ ]]          || { echo "::error::bad pr"; exit 2; }
+          [ -n "$REASON" ] || { echo "::error::reason is required"; exit 2; }
+          { echo "REPO=$REPO"; echo "PR=$PR"; } >> "$GITHUB_ENV"
+
+      - uses: actions/create-github-app-token@v1
+        id: app
+        with:
+          app-id: ${{ vars.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Merge
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          # Checks still have to be green. A hotfix skips the batch, not the tests.
+          bad=$(gh pr view "$PR" -R "$ORG/$REPO" --json statusCheckRollup \
+                -q '[.statusCheckRollup[]? | (.conclusion // .state // "PENDING") | ascii_upcase
+                     | select(IN("SUCCESS","NEUTRAL","SKIPPED") | not)] | length')
+          [ "$bad" = 0 ] || { echo "::error::$bad checks not green"; exit 1; }
+          gh pr merge "$PR" -R "$ORG/$REPO" --squash --delete-branch
+          { echo "hotfix: $ORG/$REPO#$PR merged"; echo; echo "reason: $REASON"; } >> "$GITHUB_STEP_SUMMARY"

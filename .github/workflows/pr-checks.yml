@@ -1,0 +1,161 @@
+name: pr-checks
+
+# Reusable. App repos call it from their own thin wrapper, which is what keeps the
+# scripts in one place instead of copied into seven repos.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+env:
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  ticket:
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.parse.outputs.id }}
+    steps:
+      - id: parse
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          id=$(grep -oiE 'ENG-[0-9]+' <<<"$TITLE" | head -1 | tr '[:lower:]' '[:upper:]' || true)
+          if [ -z "$id" ]; then
+            echo "::error::PR title must contain a ticket id, e.g. ENG-123 short description"
+            exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "ticket id: $id" >> "$GITHUB_STEP_SUMMARY"
+
+  related-prs-green:
+    needs: ticket
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.SANDBOX_GH_TOKEN }}
+          ID: ${{ needs.ticket.outputs.id }}
+          SELF: ${{ github.event.repository.name }}
+          NUM: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "no cross-repo token, did not check sibling PRs" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Code search tokenizes on the hyphen, so re-filter the titles ourselves.
+          gh search prs --owner "$OWNER" --match title "$ID" --state open --limit 50 \
+            --json repository,number,title \
+            -q '.[] | [.repository.name, (.number|tostring), .title] | @tsv' \
+            > raw.tsv || { echo "::error::sibling search failed; refusing to pass without knowing"; exit 1; }
+          awk -F'\t' -v id="$ID" 'toupper($3) ~ ("\\<" toupper(id) "\\>")' raw.tsv > siblings.tsv
+
+          # Kaleb's cross-check: Linear attaches PRs to the issue independently, so if it
+          # knows about more than the search found, a PR exists the reviewer cannot see.
+          if [ -n "${LINEAR_API_KEY:-}" ]; then
+            q='query($i:String!){issue(id:$i){attachments{nodes{url}}}}'
+            linear_prs=$(curl -sS --max-time 20 https://api.linear.app/graphql \
+              -H "Authorization: $LINEAR_API_KEY" -H 'content-type: application/json' \
+              -d "$(jq -nc --arg q "$q" --arg i "$ID" '{query:$q,variables:{i:$i}}')" \
+              | jq -r '[.data.issue.attachments.nodes[]?.url
+                        | select(test("github\\.com/[^/]+/[^/]+/pull/[0-9]+"))]
+                       | unique | .[]' 2>/dev/null | sort)
+            searched=$(cut -f1,2 siblings.tsv | awk -F'\t' '{printf "https://github.com/'"$OWNER"'/%s/pull/%s\n",$1,$2}' | sort)
+            missing=$(comm -23 <(printf '%s\n' "$linear_prs" | sed '/^$/d') <(printf '%s\n' "$searched" | sed '/^$/d'))
+            if [ -n "$missing" ]; then
+              echo "::error::Linear has PRs on $ID that the search did not find:"
+              printf '%s\n' "$missing" | sed 's/^/  /'
+              exit 1
+            fi
+            unattached=$(comm -13 <(printf '%s\n' "$linear_prs" | sed '/^$/d') <(printf '%s\n' "$searched" | sed '/^$/d'))
+            [ -z "$unattached" ] || {
+              echo "::warning::not attached to $ID in Linear, the ticket understates the batch:"
+              printf '%s\n' "$unattached" | sed 's/^/  /'; }
+          fi
+
+          fail=0; found=0
+          while IFS=$'\t' read -r repo num title; do
+            [ -z "${repo:-}" ] && continue
+            if [ "$repo" = "$SELF" ] && [ "$num" = "$NUM" ]; then continue; fi
+            found=1
+            bad=$(gh pr view "$num" -R "$OWNER/$repo" --json statusCheckRollup \
+              -q '[.statusCheckRollup[]
+                   | (.conclusion // .state // "PENDING") | ascii_upcase
+                   | select(IN("SUCCESS","NEUTRAL","SKIPPED") | not)]
+                  | length')
+            echo "- \`$repo#$num\` failing checks: $bad  ($title)" >> "$GITHUB_STEP_SUMMARY"
+            [ "$bad" = 0 ] || fail=1
+          done < siblings.tsv
+
+          [ "$found" = 1 ] || echo "$ID touches this repo only" >> "$GITHUB_STEP_SUMMARY"
+          [ "$fail" = 0 ] || echo "::error::a sibling PR on $ID is red"
+          exit $fail
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          if [ -f Dockerfile ]; then docker build -q -t check .; else echo "no Dockerfile"; fi
+      - run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run build --if-present
+            npm test --if-present
+          else
+            echo "no package.json"
+          fi
+
+  deterministic:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg15
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      BASE: ${{ github.event.pull_request.base.ref }}
+      TITLE: ${{ github.event.pull_request.title }}
+      BODY: ${{ github.event.pull_request.body }}
+      ADDITIONS: ${{ github.event.pull_request.additions }}
+      GH_TOKEN: ${{ secrets.SANDBOX_GH_TOKEN }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+      INFISICAL_TOKEN: ${{ secrets.INFISICAL_TOKEN }}
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_PROD_SERVICE: ${{ vars.RAILWAY_PROD_SERVICE }}
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      INFISICAL_DEB_SHA256: 43e5c251ce5ba078f3751f76971a816f7b9f99c2fe4a938848af5cf5b087bf3c
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      # The scripts must come from THIS repo at the same commit as this workflow, not
+      # from the PR: a reusable workflow's default checkout is the caller, and the PR
+      # could otherwise edit checks.sh and read every secret below.
+      - uses: actions/checkout@v4
+        with:
+          repository: bluejay-ai-dev/bluejay-github-actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .gating
+      # env-vars fails closed without this, so it is a dependency rather than a nicety.
+      - name: Install infisical
+        if: env.INFISICAL_TOKEN != ''
+        run: |
+          curl -fsSL -o /tmp/infisical.deb \
+            https://github.com/Infisical/infisical/releases/download/infisical-cli%2Fv0.41.90/infisical_0.41.90_linux_amd64.deb
+          echo "$INFISICAL_DEB_SHA256  /tmp/infisical.deb" | sha256sum -c -
+          sudo dpkg -i /tmp/infisical.deb >/dev/null
+      - { if: always(), name: ticket-sane,           run: .gating/bin/checks.sh ticket-sane }
+      - { if: always(), name: video,                 run: .gating/bin/checks.sh video }
+      - { if: always(), name: migrations-immutable,  run: .gating/bin/checks.sh migrations-immutable }
+      - { if: always(), name: migrations-newest,     run: .gating/bin/checks.sh migrations-newest }
+      - { if: always(), name: migrations-have-down,  run: .gating/bin/checks.sh migrations-have-down }
+      - { if: always(), name: migrations-round-trip, run: .gating/bin/checks.sh migrations-round-trip }
+      - { if: always(), name: rls,                   run: .gating/bin/checks.sh rls }
+      - { if: always(), name: codegen,               run: .gating/bin/checks.sh codegen }
+      - { if: always(), name: env-vars,              run: .gating/bin/checks.sh env-vars }
+      - { if: always(), name: deps-bounded,          run: .gating/bin/checks.sh deps-bounded }
