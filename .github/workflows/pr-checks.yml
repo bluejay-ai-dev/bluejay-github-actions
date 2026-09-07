@@ -54,8 +54,7 @@ jobs:
           awk -F'\t' -v id="$ID" 'toupper($3) ~ ("\\<" toupper(id) "\\>")' raw.tsv > siblings.tsv
 
           # Kaleb's cross-check: Linear attaches PRs to the issue independently, so if it
-          # knows about more than the search found, a PR exists that the reviewer cannot
-          # see from here. Two sources disagreeing is the signal; neither is authoritative.
+          # knows about more than the search found, a PR exists the reviewer cannot see.
           if [ -n "${LINEAR_API_KEY:-}" ]; then
             q='query($i:String!){issue(id:$i){attachments{nodes{url}}}}'
             linear_prs=$(curl -sS --max-time 20 https://api.linear.app/graphql \
@@ -66,22 +65,15 @@ jobs:
                        | unique | .[]' 2>/dev/null | sort)
             searched=$(cut -f1,2 siblings.tsv | awk -F'\t' '{printf "https://github.com/'"$OWNER"'/%s/pull/%s\n",$1,$2}' | sort)
             missing=$(comm -23 <(printf '%s\n' "$linear_prs" | sed '/^$/d') <(printf '%s\n' "$searched" | sed '/^$/d'))
-            # Fails: a PR the gate cannot see is a PR it cannot gate.
             if [ -n "$missing" ]; then
               echo "::error::Linear has PRs on $ID that the search did not find:"
               printf '%s\n' "$missing" | sed 's/^/  /'
-              echo "Linear knows about PRs this gate cannot see:" >> "$GITHUB_STEP_SUMMARY"
-              printf '%s\n' "$missing" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
-            # Warns: the ticket is missing an attachment, so a human reading Linear sees
-            # less than the batch actually contains. Usually the integration is not on
-            # that repo. Not fatal, because the gate can still see the PR.
             unattached=$(comm -13 <(printf '%s\n' "$linear_prs" | sed '/^$/d') <(printf '%s\n' "$searched" | sed '/^$/d'))
-            if [ -n "$unattached" ]; then
+            [ -z "$unattached" ] || {
               echo "::warning::not attached to $ID in Linear, the ticket understates the batch:"
-              printf '%s\n' "$unattached" | sed 's/^/  /'
-            fi
+              printf '%s\n' "$unattached" | sed 's/^/  /'; }
           fi
 
           fail=0; found=0
@@ -137,24 +129,33 @@ jobs:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
       RAILWAY_PROD_SERVICE: ${{ vars.RAILWAY_PROD_SERVICE }}
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      INFISICAL_DEB_SHA256: 43e5c251ce5ba078f3751f76971a816f7b9f99c2fe4a938848af5cf5b087bf3c
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      # env-vars refuses to run without this rather than passing having checked nothing,
-      # so it is a real dependency of the job, not a convenience.
+      # The scripts must come from THIS repo at the same commit as this workflow, not
+      # from the PR: a reusable workflow's default checkout is the caller, and the PR
+      # could otherwise edit checks.sh and read every secret below.
+      - uses: actions/checkout@v4
+        with:
+          repository: bluejay-ai-dev/bluejay-github-actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .gating
+      # env-vars fails closed without this, so it is a dependency rather than a nicety.
       - name: Install infisical
         if: env.INFISICAL_TOKEN != ''
         run: |
           curl -fsSL -o /tmp/infisical.deb \
             https://github.com/Infisical/infisical/releases/download/infisical-cli%2Fv0.41.90/infisical_0.41.90_linux_amd64.deb
+          echo "$INFISICAL_DEB_SHA256  /tmp/infisical.deb" | sha256sum -c -
           sudo dpkg -i /tmp/infisical.deb >/dev/null
-      - { if: always(), name: ticket-sane,           run: bin/checks.sh ticket-sane }
-      - { if: always(), name: video,                 run: bin/checks.sh video }
-      - { if: always(), name: migrations-immutable,  run: bin/checks.sh migrations-immutable }
-      - { if: always(), name: migrations-newest,     run: bin/checks.sh migrations-newest }
-      - { if: always(), name: migrations-have-down,  run: bin/checks.sh migrations-have-down }
-      - { if: always(), name: migrations-round-trip, run: bin/checks.sh migrations-round-trip }
-      - { if: always(), name: rls,                   run: bin/checks.sh rls }
-      - { if: always(), name: codegen,               run: bin/checks.sh codegen }
-      - { if: always(), name: env-vars,              run: bin/checks.sh env-vars }
-      - { if: always(), name: deps-bounded,          run: bin/checks.sh deps-bounded }
+      - { if: always(), name: ticket-sane,           run: .gating/bin/checks.sh ticket-sane }
+      - { if: always(), name: video,                 run: .gating/bin/checks.sh video }
+      - { if: always(), name: migrations-immutable,  run: .gating/bin/checks.sh migrations-immutable }
+      - { if: always(), name: migrations-newest,     run: .gating/bin/checks.sh migrations-newest }
+      - { if: always(), name: migrations-have-down,  run: .gating/bin/checks.sh migrations-have-down }
+      - { if: always(), name: migrations-round-trip, run: .gating/bin/checks.sh migrations-round-trip }
+      - { if: always(), name: rls,                   run: .gating/bin/checks.sh rls }
+      - { if: always(), name: codegen,               run: .gating/bin/checks.sh codegen }
+      - { if: always(), name: env-vars,              run: .gating/bin/checks.sh env-vars }
+      - { if: always(), name: deps-bounded,          run: .gating/bin/checks.sh deps-bounded }
