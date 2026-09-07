@@ -10,8 +10,11 @@
 name: nightly
 
 on:
-  schedule:
-    - cron: '0 9 * * *'   # 02:00 PT / 09:00 UTC, before anyone is working
+  # Schedule is off until the fixture org exists. Without TEST_SUITE_* the run dies at
+  # preflight, and a workflow that goes red every morning teaches people to ignore red.
+  # Uncomment when the fixtures are in. Manual dispatch works meanwhile.
+  # schedule:
+  #   - cron: '0 9 * * *'   # 09:00 UTC, so 01:00 PST / 02:00 PDT
   workflow_dispatch:
     inputs:
       parts:
