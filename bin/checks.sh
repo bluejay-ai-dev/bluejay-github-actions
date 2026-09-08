@@ -32,7 +32,7 @@ c_ticket_sane() {
   [ "$n" = 1 ] || die "title carries $n ticket ids, want exactly 1: ${TITLE:-<empty title>}"
   id=$(ticket_id)
   echo "ok: title carries $id"
-  [ -n "${LINEAR_API_KEY:-}" ] || skip "LINEAR_API_KEY not set, did not confirm $id in Linear"
+  [ -n "${LINEAR_API_KEY:-}" ] || die "LINEAR_API_KEY not set, cannot confirm $id is a real ticket"
   st=$(linear "$id" 'state{name}' | jq -r '.data.issue.state.name // "MISSING"')
   case "$st" in
     MISSING)       die "$id does not exist in Linear" ;;
@@ -56,7 +56,7 @@ c_video() {
   repos="$repos ${GITHUB_REPOSITORY##*/}"
   case "$repos" in *frontend*) ;; *) skip "no frontend repo on $id (${repos# }), no video required" ;; esac
   if grep -qE "$VIDEO" <<<"${BODY:-}"; then echo "ok: video in the PR body"; return 0; fi
-  [ -n "${LINEAR_API_KEY:-}" ] || skip "no video in the PR body and LINEAR_API_KEY not set, did not read $id"
+  [ -n "${LINEAR_API_KEY:-}" ] || die "no video in the PR body and LINEAR_API_KEY not set, cannot read $id"
   d=$(linear "$id" description | jq -r '.data.issue.description // ""')
   grep -qE "$VIDEO" <<<"$d" || die "frontend change with ${ADDITIONS} additions needs a video on $id or in the PR body"
   echo "ok: video on $id"
