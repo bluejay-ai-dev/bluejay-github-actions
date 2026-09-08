@@ -1,0 +1,20 @@
+{
+  "_comment": "Statements to ADD to the bluejay-devbox-engineer managed policy. Not a standalone policy. ec2:DescribeSecurityGroupRules also belongs in the existing ReadOnlyLookups action list; without it bj cannot see which ingress rules are stale and silently stops pruning.",
+  "Statement": [
+    {
+      "Sid": "OnlyMyKeyPair",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateKeyPair",
+        "ec2:DeleteKeyPair"
+      ],
+      "Resource": "arn:aws:ec2:us-east-1:148660429236:key-pair/bluejay-devbox-${aws:username}"
+    },
+    {
+      "Sid": "SeeSecurityGroupRules",
+      "Effect": "Allow",
+      "Action": "ec2:DescribeSecurityGroupRules",
+      "Resource": "*"
+    }
+  ]
+}

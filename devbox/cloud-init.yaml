@@ -1,0 +1,223 @@
+#cloud-config
+# Provisions a Bluejay dev box. `bj up` appends the idle-shutdown script to the
+# write_files list below, so write_files MUST stay the last top-level key here.
+#
+# Repos are NOT cloned at boot: they are private, and baking a GitHub token into
+# user-data would put a long-lived credential on every box. `bj ssh` forwards the
+# agent instead, so `bj-clone` on the box uses the engineer's own key.
+runcmd:
+  # From a baked AMI the slow half is already done, so only the per-boot half runs.
+  - [ bash, -lc, "test -e /var/lib/bj-baked || /usr/local/bin/bj-provision 2>&1 | tee /var/log/bj-provision.log" ]
+  - [ bash, -lc, "/usr/local/bin/bj-boot 2>&1 | tee -a /var/log/bj-provision.log" ]
+
+# write_files is last on purpose: `bj up` appends the idle-shutdown entry to it.
+write_files:
+  - path: /etc/sysctl.d/99-bluejay-devbox.conf
+    content: |
+      # next dev watches the whole tree and Supabase brings ~10 containers; the
+      # stock inotify limits are the first thing the stack hits on Linux.
+      fs.inotify.max_user_watches=524288
+      fs.inotify.max_user_instances=1024
+      vm.max_map_count=262144
+
+  # Fill INFISICAL_MACHINE_IDENTITY_ID in before rolling this out. Empty means
+  # every engineer still runs `infisical login` by hand on every box.
+  # The identity MUST be scoped read-only to the dev environment: see README.md.
+  - path: /etc/bj.env
+    content: |
+      INFISICAL_MACHINE_IDENTITY_ID=
+
+  - path: /etc/systemd/system/bj-infisical.service
+    content: |
+      [Unit]
+      Description=Authenticate to Infisical with the EC2 instance role
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      EnvironmentFile=/etc/bj.env
+      RuntimeDirectory=bj
+      RuntimeDirectoryMode=0755
+      ExecStart=/usr/local/bin/bj-infisical-login
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /usr/local/bin/bj-infisical-login
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # aws-iam auth signs an sts:GetCallerIdentity with the instance role and hands
+      # the signed request to Infisical, so no secret is stored, baked or rotated.
+      # The token lands on tmpfs and dies with the box; it never reaches an AMI.
+      set -euo pipefail
+      id="${INFISICAL_MACHINE_IDENTITY_ID:-}"
+      [ -n "$id" ] || { echo "INFISICAL_MACHINE_IDENTITY_ID unset; run 'infisical login' by hand"; exit 0; }
+      umask 077
+      infisical login --method=aws-iam --machine-identity-id="$id" --plain --silent > /run/bj/infisical-token
+      chown ubuntu:ubuntu /run/bj/infisical-token
+      echo "infisical: logged in as machine identity $id"
+
+  - path: /usr/local/bin/bj-boot
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Runs every boot, including from a baked AMI where bj-provision is skipped.
+      # /var/lib/bj-provisioned is the readiness marker and is written here, not in
+      # the AMI, so it means the same thing on a fresh box and a baked one.
+      set -eux
+      sysctl --system
+      systemctl daemon-reload
+      systemctl enable --now bj-idle.timer
+      systemctl enable bj-infisical.service
+      systemctl restart bj-infisical.service || true
+      touch /var/lib/bj-provisioned
+
+  - path: /etc/systemd/system/bj-idle.service
+    content: |
+      [Unit]
+      Description=Shut the dev box down when idle
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/bin/bj-idle-shutdown
+
+  - path: /etc/systemd/system/bj-idle.timer
+    content: |
+      [Unit]
+      Description=Idle check for the dev box
+      [Timer]
+      # First check is delayed past provisioning so a fresh box is never killed
+      # before its owner has had a chance to log in.
+      OnBootSec=20min
+      OnUnitActiveSec=5min
+      [Install]
+      WantedBy=timers.target
+
+  - path: /usr/local/bin/bj-clone
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Clone the workspace using the ssh agent forwarded by `bj ssh`.
+      set -euo pipefail
+      cd "$HOME"
+      [ -d bluejay-local ] && { echo "bluejay-local already exists"; exit 0; }
+      ssh-add -l >/dev/null 2>&1 || { echo "no forwarded ssh agent; reconnect with 'bj ssh'"; exit 1; }
+      ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+      # setup-workspace.sh prefers `gh repo clone`, and gh is installed here but not
+      # logged in, so it fails instead of falling back to ssh. Read its repo list and
+      # clone over ssh ourselves. One source of truth, no credential on the box.
+      tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+      git clone -q git@github.com:bluejay-ai-dev/bluejay-local.git "$tmp/local"
+      mkdir -p "$HOME/bluejay-local"
+      awk '/^clone +[a-z]/ {gsub(/"|\$TARGET\//,"",$4); print $2, $3, $4}' \
+        "$tmp/local/setup-workspace.sh" |
+      while read -r repo branch dest; do
+        [ -d "$HOME/bluejay-local/$dest" ] && continue
+        echo "cloning $repo ($branch)"
+        git clone -q --branch "$branch" --single-branch \
+          "git@github.com:bluejay-ai-dev/$repo.git" "$HOME/bluejay-local/$dest" &
+      done
+      wait
+      ls -1 "$HOME/bluejay-local"
+
+  - path: /usr/local/bin/bj-provision
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      # Rerunnable: every step is idempotent, so a partial first boot is fixed by
+      # re-running this rather than rebuilding the box.
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      arch=$(dpkg --print-architecture)
+
+      # Was cloud-config `packages:`, which re-ran on every boot of a baked box
+      # and cost 81 s to reinstall what the AMI already had.
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git gnupg htop jq just \
+        postgresql-client python3.12-venv ripgrep software-properties-common \
+        tmux unzip
+
+      install -m 0755 -d /etc/apt/keyrings
+
+      # docker-ce, not docker.io: the supabase CLI needs compose v2
+      if [ ! -e /etc/apt/keyrings/docker.asc ]; then
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        echo "deb [arch=$arch signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+          > /etc/apt/sources.list.d/docker.list
+      fi
+
+      if [ ! -e /etc/apt/keyrings/githubcli.gpg ]; then
+        curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          | gpg --dearmor -o /etc/apt/keyrings/githubcli.gpg
+        echo "deb [arch=$arch signed-by=/etc/apt/keyrings/githubcli.gpg] https://cli.github.com/packages stable main" \
+          > /etc/apt/sources.list.d/github-cli.list
+      fi
+
+      if [ ! -e /etc/apt/keyrings/nodesource.gpg ]; then
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+          | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+        echo "deb [arch=$arch signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" \
+          > /etc/apt/sources.list.d/nodesource.list
+      fi
+
+      # bluejay-local pins its venvs to python3.11; 24.04 only ships 3.12
+      add-apt-repository -y ppa:deadsnakes/ppa
+
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        gh nodejs python3.11 python3.11-venv python3.11-dev
+
+      usermod -aG docker ubuntu
+      systemctl enable --now docker
+
+      # binaries with no apt repo
+      deb() { local u=$1 f; f=$(mktemp --suffix=.deb); curl -fsSL "$u" -o "$f"; dpkg -i "$f"; rm -f "$f"; }
+      command -v supabase >/dev/null || \
+        deb "$(curl -fsSL https://api.github.com/repos/supabase/cli/releases/latest \
+              | jq -r --arg a "$arch" '.assets[] | select(.name | endswith("_linux_" + $a + ".deb")) | .browser_download_url' | head -1)"
+      command -v dbmate >/dev/null || {
+        curl -fsSL -o /usr/local/bin/dbmate \
+          "https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-$arch"
+        chmod +x /usr/local/bin/dbmate; }
+
+      # bluejay-local's ./up installs these via brew, which does not exist here.
+      # Pin the release rather than the cloudsmith apt repo: that repo is deprecated
+      # and serves 0.38, which still demands `infisical init` even when given
+      # --projectId, so every lambda build fails with "cloud secrets missing".
+      INFISICAL_VER=0.41.90
+      command -v infisical >/dev/null || {
+        curl -fsSL -o /tmp/inf.deb \
+          "https://github.com/Infisical/infisical/releases/download/infisical-cli%2Fv${INFISICAL_VER}/infisical_${INFISICAL_VER}_linux_${arch}.deb"
+        dpkg -i /tmp/inf.deb; rm -f /tmp/inf.deb; }
+      command -v claude >/dev/null || npm install -g @anthropic-ai/claude-code
+
+      # Bluejay AI hands its MCP URL to Anthropic, whose hosted client fetches it, so the
+      # stack needs a public tunnel or bin/tunnel returns nothing and the in-app chat is
+      # silently off. bluejay-local installs this with brew, which is not an option here.
+      command -v cloudflared >/dev/null || {
+        curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+          && dpkg -i /tmp/cf.deb >/dev/null 2>&1; rm -f /tmp/cf.deb; }
+
+      # uv and honcho land in the engineer's account, not root's
+      sudo -u ubuntu -H bash -lc '
+        command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+        export PATH="$HOME/.local/bin:$PATH"
+        uv tool install honcho
+      '
+      # /etc/environment, not .bashrc. sshd runs pam_env for every session, so
+      # this reaches `ssh host cmd` and tmux; an append to .bashrc lands after
+      # Ubuntu's early return and leaves `just start` unable to find honcho.
+      grep -q '/home/ubuntu/.local/bin' /etc/environment || \
+        sed -i 's|^PATH="|PATH="/home/ubuntu/.local/bin:|' /etc/environment
+
+      # First line of .bashrc: Ubuntu's stock bashrc returns early for the
+      # non-interactive shells that `ssh host cmd` and tmux use.
+      grep -q bj-infisical /home/ubuntu/.bashrc || \
+        sed -i '1i [ -r /run/bj/infisical-token ] && export INFISICAL_TOKEN="$(cat /run/bj/infisical-token)"  # bj-infisical' /home/ubuntu/.bashrc
+
+      touch /var/lib/bj-baked
+
+# --- bj appends the idle-shutdown write_files entry below this line ---

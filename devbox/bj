@@ -1,0 +1,684 @@
+#!/usr/bin/env bash
+# One personal EC2 dev box per engineer. See README.md.
+set -euo pipefail
+
+REGION="${BJ_REGION:-us-east-1}"
+INSTANCE_TYPE="${BJ_INSTANCE_TYPE:-m7i-flex.2xlarge}"
+VOLUME_GB="${BJ_VOLUME_GB:-150}"
+# The IAM policy binds the owner tag to ${aws:username}, so the tag must be the
+# AWS username, not whatever the laptop's unix account is called.
+# No fallback on purpose. A silent second identity means `bj up` creates a new
+# box instead of starting the one you already have, and you pay for both.
+# 2>&1 on purpose. Discarding aws's stderr here meant an expired SSO session produced an
+# empty OWNER and a bare exit with no message at all, which reads as bj being broken.
+if [ -n "${BJ_OWNER:-}" ]; then
+  OWNER="$BJ_OWNER"
+else
+  _who="$(command aws sts get-caller-identity --query Arn --output text 2>&1)" || true
+  case "$_who" in
+    arn:*) OWNER="${_who##*[:/]}" ;;
+    *) printf '\033[1;31m%s\033[0m\n' "AWS credentials are not usable, so bj cannot find your box." >&2
+       printf '  %s\n' "${_who:-aws produced no output}" >&2
+       printf '  %s\n' "Fix: aws login" >&2
+       exit 1 ;;
+  esac
+fi
+# One key pair per engineer. A single shared pair has only two end states, and both
+# are wrong: one person holds the .pem and nobody else can use bj, or the .pem gets
+# passed around and everybody can ssh into everybody's box. Named from the AWS
+# username for the same reason the owner tag is, so IAM can bind it.
+KEY_NAME="${BJ_KEY_NAME:-bluejay-devbox-$OWNER}"
+KEY_FILE="${BJ_KEY_FILE:-$HOME/.ssh/$KEY_NAME.pem}"
+LEGACY_KEY_FILE="${BJ_LEGACY_KEY_FILE:-$HOME/.ssh/bluejay-devbox.pem}"
+SG_NAME="${BJ_SG_NAME:-bluejay-devbox}"
+PROFILE="${BJ_INSTANCE_PROFILE:-bluejay-devbox}"
+# Filled in by pick_block from what is free on THIS machine, not the box.
+PORTS="${BJ_PORTS:-3000,8000}"
+PREVIEW_ORG="${BJ_PREVIEW_ORG:-bluejay-ai-dev}"
+PREVIEW_REPOS="${BJ_PREVIEW_REPOS:-bluejay_middleware bluejay_frontend_v2 livekit_agent text_agent evals livekit_dispatcher emails-lambda bluejay-local docs}"
+STACK_N=0
+TUNNEL_SOCK="${BJ_TUNNEL_SOCK:-$HOME/.ssh/bj-tunnel.sock}"
+AMI_PARAM=/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export AWS_PAGER=""
+aws() { command aws --region "$REGION" "$@"; }
+
+die() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
+inf() { printf '\033[1;34m==>\033[0m %s\n' "$*" >&2; }
+
+# --- lookups -----------------------------------------------------------------
+
+# Terminated instances keep their tags for an hour, so they must be excluded or
+# `up` would try to start a corpse instead of creating a replacement.
+# Engineers select their box by owner; a preview selects by ticket. Same lifecycle
+# code, different tag, so `up`/`down`/`status` do not fork into two implementations.
+# A preview is the same box as a devbox, tagged for a ticket instead of a person, so CI
+# can own one without an engineer. The preview IAM role can only touch instances carrying
+# bluejay:preview-ticket, which is why the tag has to be set at RunInstances, not after.
+if [ -n "${BJ_PREVIEW_TICKET:-}" ]; then
+  TAG_KEY="bluejay:preview-ticket"; TAG_VAL="$BJ_PREVIEW_TICKET"
+  INSTANCE_NAME="bluejay-preview-$BJ_PREVIEW_TICKET"
+else
+  TAG_KEY="${TAG_KEY:-bluejay:devbox-owner}"; TAG_VAL=""
+  INSTANCE_NAME="bluejay-devbox-$OWNER"
+fi
+
+instance_json() {
+  aws ec2 describe-instances \
+    --filters "Name=tag:$TAG_KEY,Values=${TAG_VAL:-$OWNER}" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].{Id:InstanceId,State:State.Name,Dns:PublicDnsName,Ip:PublicIpAddress,Type:InstanceType}' \
+    --output json
+}
+instance_field() { instance_json | python3 -c "import json,sys; r=json.load(sys.stdin); print(r[0]['$1'] if r else '')"; }
+
+my_ip() { curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]'; }
+
+# A baked AMI turns a 10 min first boot into ~90 s. Fall back to stock Ubuntu so
+# the tool still works in an account where nobody has run `bj bake` yet.
+resolve_ami() {
+  local ami
+  ami="$(aws ec2 describe-images --owners self \
+    --filters "Name=tag:bluejay:devbox-ami,Values=1" "Name=state,Values=available" \
+    --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text 2>/dev/null || true)"
+  [ -n "$ami" ] && [ "$ami" != None ] && { echo "$ami"; return; }
+  aws ssm get-parameters --names "$AMI_PARAM" --query 'Parameters[0].Value' --output text
+}
+
+# Infisical authenticates the box with its instance role, so a box without a
+# profile has to log in by hand. Attaching one needs no stop or reboot.
+ensure_instance_profile() {
+  local id=$1
+  [ "$(aws ec2 describe-iam-instance-profile-associations \
+        --filters "Name=instance-id,Values=$id" "Name=state,Values=associating,associated" \
+        --query 'length(IamInstanceProfileAssociations)' --output text)" = 0 ] || return 0
+  inf "attaching instance profile $PROFILE to $id"
+  aws ec2 associate-iam-instance-profile --instance-id "$id" \
+    --iam-instance-profile "Name=$PROFILE" >/dev/null
+}
+
+# --- one-time-ish setup, all idempotent --------------------------------------
+
+ensure_key() {
+  if ! aws ec2 describe-key-pairs --key-names "$KEY_NAME" >/dev/null 2>&1; then
+    [ -e "$KEY_FILE" ] && die "$KEY_NAME missing in AWS but $KEY_FILE exists; move it aside or set BJ_KEY_NAME"
+    inf "creating key pair $KEY_NAME -> $KEY_FILE"
+    mkdir -p "$(dirname "$KEY_FILE")"
+    # Through a temp file. With the redirect straight at $KEY_FILE, a create that was
+    # denied still left an empty .pem behind, and every later run then refused to do
+    # anything because a file existed where a key should be.
+    local tmp; tmp="$(mktemp)"
+    aws ec2 create-key-pair --key-name "$KEY_NAME" --query KeyMaterial --output text > "$tmp" \
+      || { rm -f "$tmp"; die "could not create key pair $KEY_NAME. Needs ec2:CreateKeyPair: see iam/devbox-engineer-keypair-delta.json"; }
+    chmod 600 "$tmp"; mv "$tmp" "$KEY_FILE"
+  fi
+  # AWS keeps no copy of the private half, so there is nothing to re-download. Delete
+  # the pair and bj makes another; a box already running keeps trusting the old one,
+  # so it needs the shared key or a rebuild to get you back in.
+  [ -f "$KEY_FILE" ] || die "key pair $KEY_NAME exists in AWS but $KEY_FILE is gone.
+Private keys cannot be recovered. Start over with:
+  aws ec2 delete-key-pair --key-name $KEY_NAME"
+}
+
+# Rules as "id description cidr port" on stdin; prints the ids to drop. Split out so
+# test-sg-prune.sh can feed it a table without touching a real security group.
+stale_rules() { # $1 my-cidr, $2 space-padded ports to keep
+  local ip=$1 keep=$2 rid desc cidr port
+  while read -r rid desc cidr port; do
+    [ "$desc" = "$OWNER" ] || continue
+    if [ "$cidr" = "$ip" ]; then case "$keep" in *" $port "*) continue ;; esac; fi
+    echo "$rid"
+  done
+}
+
+ensure_sg() {
+  local sg ip stale
+  sg="$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$SG_NAME" \
+        --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)"
+  if [ -z "$sg" ] || [ "$sg" = "None" ]; then
+    inf "creating security group $SG_NAME (ssh only)"
+    sg="$(aws ec2 create-security-group --group-name "$SG_NAME" \
+          --description "Bluejay dev boxes: ssh and app ports from engineer IPs" \
+          --tag-specifications "ResourceType=security-group,Tags=[{Key=bluejay:managed-by,Value=bj}]" \
+          --query GroupId --output text)"
+  fi
+  # Roaming laptops change IP, so re-authorise the current one every `up`.
+  ip="$(my_ip)/32"
+  # Nothing ever removed the previous ones. A new network or a different stack block
+  # only ever added rules, and a security group stops at 60 inbound. The authorize
+  # below swallows its own error, so past the cap ssh just starts refusing with
+  # nothing to read. Drop this owner's rules that are not the ones about to be
+  # authorised; every other engineer's rule carries their own description, so their
+  # access is never in scope here.
+  stale="$(aws ec2 describe-security-group-rules --filters "Name=group-id,Values=$sg" \
+             --query "SecurityGroupRules[?IsEgress==\`false\` && Description=='$OWNER'].[SecurityGroupRuleId,Description,CidrIpv4,FromPort]" \
+             --output text 2>/dev/null | stale_rules "$ip" " 22 ${PORTS//,/ } " | tr '\n' ' ')"
+  # shellcheck disable=SC2086
+  [ -n "$stale" ] && aws ec2 revoke-security-group-ingress --group-id "$sg" \
+    --security-group-rule-ids $stale >/dev/null 2>&1 || true
+  for p in 22 ${PORTS//,/ }; do
+    aws ec2 authorize-security-group-ingress --group-id "$sg" \
+      --ip-permissions "IpProtocol=tcp,FromPort=$p,ToPort=$p,IpRanges=[{CidrIp=$ip,Description=$OWNER}]" \
+      >/dev/null 2>&1 || true
+  done
+  echo "$sg"
+}
+
+# idle-shutdown lives in its own file so it stays readable and testable; splice it
+# into user-data at launch instead of keeping a second copy inside the YAML.
+build_userdata() {
+  cat "$HERE/cloud-init.yaml"
+  echo "  - path: /usr/local/bin/bj-idle-shutdown"
+  echo "    permissions: '0755'"
+  echo "    encoding: b64"
+  echo "    content: $(base64 < "$HERE/idle-shutdown" | tr -d '\n')"
+}
+
+# --- subcommands -------------------------------------------------------------
+
+key_works() { # $1 pem, $2 host
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+      -i "$1" "ubuntu@$2" true 2>/dev/null
+}
+
+wait_ssh() {
+  local host=$1 pub
+  inf "waiting for ssh on $host"
+  for _ in $(seq 1 60); do
+    key_works "$KEY_FILE" "$host" && return 0
+    # EC2 injects a key pair once, at first boot, so a box launched on the old shared
+    # pair can never be moved onto a personal one by AWS. Install it over the shared
+    # key instead: same box, same disk, no rebuild. Runs once, then the branch is dead.
+    if [ -f "$LEGACY_KEY_FILE" ] && key_works "$LEGACY_KEY_FILE" "$host"; then
+      inf "authorising $KEY_NAME on $host over the shared key"
+      # type and base64 only. The comment is useless here and it is the one field
+      # that could carry a quote into the single-quoted remote command below.
+      pub="$(ssh-keygen -y -f "$KEY_FILE" | awk '{print $1" "$2}')"
+      if ssh -n -o StrictHostKeyChecking=accept-new -i "$LEGACY_KEY_FILE" "ubuntu@$host" \
+           "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys &&
+            grep -qxF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys"; then
+        key_works "$KEY_FILE" "$host" && return 0
+      fi
+    fi
+    sleep 5
+  done
+  die "ssh never came up on $host"
+}
+
+cmd_up() {  # [service ...] -> started in tmux after the box is up
+  ensure_key
+  local sg id state host ami
+  sg="$(ensure_sg)"
+  id="$(instance_field Id)"
+
+  if [ -n "$id" ]; then
+    state="$(instance_field State)"
+    case "$state" in
+      running) inf "$id already running" ;;
+      stopped) inf "starting $id"; aws ec2 start-instances --instance-ids "$id" >/dev/null ;;
+      stopping)
+        inf "$id is stopping; waiting before restart"
+        aws ec2 wait instance-stopped --instance-ids "$id"
+        aws ec2 start-instances --instance-ids "$id" >/dev/null ;;
+      pending) inf "$id is booting" ;;
+    esac
+  else
+    ami="$(resolve_ami)"
+    [ -n "$ami" ] && [ "$ami" != "None" ] || die "could not resolve an AMI"
+    inf "creating a new $INSTANCE_TYPE for $OWNER from $ami"
+    local ud; ud="$(mktemp)"; trap 'rm -f "$ud"' RETURN
+    build_userdata > "$ud"
+    id="$(aws ec2 run-instances \
+      --image-id "$ami" --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
+      --security-group-ids "$sg" --count 1 \
+      --iam-instance-profile "Name=$PROFILE" \
+      --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+      --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$VOLUME_GB,VolumeType=gp3,DeleteOnTermination=true,Encrypted=true}" \
+      --user-data "file://$ud" \
+      --tag-specifications \
+        "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=$TAG_KEY,Value=${TAG_VAL:-$OWNER}}]" \
+        "ResourceType=volume,Tags=[{Key=$TAG_KEY,Value=${TAG_VAL:-$OWNER}}]" \
+      --query 'Instances[0].InstanceId' --output text)"
+    inf "$id created; first boot provisions for ~10 min after ssh opens"
+  fi
+
+  aws ec2 wait instance-running --instance-ids "$id"
+  ensure_instance_profile "$id"
+  host="$(instance_field Dns)"
+  wait_ssh "$host"
+
+  # Clone on every up. bj-clone is a no-op once the workspace exists, so this
+  # costs one round trip and means a fresh box is never half set up.
+  if ssh_q "$host" test -e /var/lib/bj-provisioned; then
+    ssh -nA -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "ubuntu@$host" bj-clone || true
+    scp -q -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" \
+      "$HERE/CLAUDE.workspace.md" "ubuntu@$host:bluejay-local/CLAUDE.md" 2>/dev/null || true
+    # A box exists to run the stack, so no arguments means all of it. Naming
+    # services is the narrow case. `just start` with no names boots everything.
+    # Before anything is started: the box has to serve the same numbers this machine
+    # can forward, so the choice is made here and pinned there.
+    pick_block "$host"
+    local s p ports=()
+    if [ "$#" -gt 0 ]; then
+      for s in "$@"; do p="$(port_for "$s")"; [ -n "$p" ] && ports+=("$p"); done
+    else
+      ports=(${PORTS//,/ })
+    fi
+    inf "starting: ${*:-full stack}"
+    ensure_tools "$host"
+    # Without cloud secrets middleware dies on its first OpenAI client and nothing
+    # binds a port. Say that now rather than after a twenty minute silent wait.
+    ssh_q "$host" '''[ -n "$INFISICAL_TOKEN" ] || grep -q . ~/.infisical/infisical-config.json 2>/dev/null''' \
+      || inf "no infisical login on the box; middleware will crash on a missing OPENAI_API_KEY. Fix: bj ssh, then 'infisical login'"
+    # Killing the tmux session SIGHUPs honcho, which does not always take its children
+    # with it. A surviving next-server holds :3000, the next `just start` dies on
+    # EADDRINUSE, and the box looks up while serving nothing. Stop properly first.
+    # `just stop` only knows about processes the stack still tracks, and an orphan is by
+    # definition one it lost, so the port holders get reaped by hand too. SIGKILL because
+    # the wedged ones spin and ignore SIGTERM. Scoped to the workspace: nothing outside
+    # ~/bluejay-local is ever a candidate.
+    ssh -n -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "ubuntu@$host" "
+      tmux kill-session -t bluejay 2>/dev/null
+      cd ~/bluejay-local/local && just stop >/dev/null 2>&1
+      # Every listener in the workspace, not just this block's ports. The previous run
+      # may have used a different block, and Next refuses to start a second dev server
+      # in the same directory, so an orphan on the old port blocks the new one.
+      for pid in \$(ss -tlnpH 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+        case \"\$(readlink -f /proc/\$pid/cwd 2>/dev/null)\" in
+          \$HOME/bluejay-local*) kill -9 \"\$pid\" 2>/dev/null ;;
+        esac
+      done" || true
+    ssh -n -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "ubuntu@$host" \
+      "tmux new -d -s bluejay 'cd ~/bluejay-local/local && BJ_STACK_N=$STACK_N just start $* 2>&1 | tee ~/bluejay-start.log'"
+    inf "logs: bj ssh -t tmux attach -t bluejay"
+    if [ "${#ports[@]}" -gt 0 ]; then
+      wait_ports "$host" "${BJ_BOOT_TIMEOUT:-1200}" "${ports[@]}" || true
+      print_urls "$host" 2 || true
+    fi
+  else
+    inf "still provisioning; clone will run on your next 'bj up'"
+    inf "watch it: bj ssh 'tail -f /var/log/bj-provision.log'"
+  fi
+
+  echo "$host"
+}
+
+ssh_q() { # quiet remote check
+  local h=$1; shift
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+      -i "$KEY_FILE" "ubuntu@$h" "$@" >/dev/null 2>&1
+}
+
+cmd_ssh() {
+  local host; host="$(instance_field Dns)"
+  [ -n "$host" ] || die "no box for $OWNER; run 'bj up'"
+  [ "$(instance_field State)" = running ] || die "box is $(instance_field State); run 'bj up'"
+  # noise on an interactive login only; `bj ssh <cmd>` stays pipeable
+  [ "$#" -eq 0 ] && print_urls "$host" 2 || true
+  # -A so private repos clone with the engineer's own GitHub key, no token on the box
+  exec ssh -A -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "ubuntu@$host" "$@"
+}
+
+cmd_down() {
+  local id; id="$(instance_field Id)"
+  [ -n "$id" ] || die "no box for $OWNER"
+  inf "stopping $id"
+  tunnel_stop
+  aws ec2 stop-instances --instance-ids "$id" >/dev/null
+  aws ec2 wait instance-stopped --instance-ids "$id"
+  echo "stopped"
+}
+
+cmd_status() {
+  local json; json="$(instance_json)"
+  python3 - "$OWNER" "$json" <<'PY'
+import json, sys
+owner, raw = sys.argv[1], sys.argv[2]
+rows = json.loads(raw)
+if not rows:
+    print(f"{owner}: no box (run 'bj up')"); sys.exit(0)
+r = rows[0]
+print(f"{owner}: {r['Id']}  {r['State']}  {r['Type']}  {r['Dns'] or '-'}")
+if len(rows) > 1:
+    print(f"WARNING: {len(rows)} boxes tagged for {owner}: " + ", ".join(x['Id'] for x in rows))
+PY
+}
+
+# frontend and middleware are the only services that serve http. The rest are
+# workers, so there is no URL to print for them.
+# Offset by the block pick_block chose, or bj waits on a port the box was never told
+# to use and reports a healthy stack as dead.
+# Which branch each repo should be on for this ticket: the open PR whose title carries
+# the id, else main. --np is skipped for the same reason env.sh skips it, so a branch
+# that opted out never lands in a preview someone else's PR created.
+preview_branches() { # $1 ticket -> "repo branch" per line
+  local id=$1 repo br
+  for repo in $PREVIEW_REPOS; do
+    br=$(gh pr list -R "$PREVIEW_ORG/$repo" --state open --limit 50 \
+         --json title,headRefName \
+         -q "first(.[]|select((.title|test(\"(^|[^A-Za-z0-9])$id([^0-9]|\$)\";\"i\")) and (.headRefName|endswith(\"--np\")|not))|.headRefName) // \"\"" 2>/dev/null)
+    printf '%s %s\n' "$repo" "${br:-main}"
+  done
+}
+
+port_for() { case $1 in frontend) echo $((3000 + STACK_N)) ;; middleware) echo $((8000 + STACK_N)) ;; esac; }
+
+# The frontend sends `upgrade-insecure-requests` in its CSP for every host that is not
+# localhost, so over the box's public name on plain http every stylesheet and script is
+# upgraded to https, fails, and the page renders as unstyled Times New Roman. proxy.ts
+# skips CSP for localhost, so a tunnel is not a nicety here, it is the only way the app
+# renders. It also needs no security group opening and gives getUserMedia a trustworthy
+# origin, which plain http on a bare IP never can.
+tunnel_stop() {
+  [ -S "$TUNNEL_SOCK" ] || return 0
+  ssh -S "$TUNNEL_SOCK" -O exit placeholder >/dev/null 2>&1 || true
+  rm -f "$TUNNEL_SOCK"
+}
+
+# Anything at all on this port, either address family. lsof is the only check that sees
+# both: ssh will happily bind just [::1] when something else holds 127.0.0.1 and report
+# success, and ExitOnForwardFailure does not catch a HALF bind. That is how a devbox
+# tunnel ended up sharing :3000 with a local dev server, making every request a coin flip
+# between two different backends and breaking sign-in.
+port_busy() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
+# bluejay-local numbers a stack from a block index: frontend 3000+n, middleware 8000+n,
+# and it bakes NEXT_PUBLIC_API_URL from the same n. The browser therefore calls the exact
+# ports the box serves, so the local and remote numbers cannot differ. The box has nothing
+# else running and always picks 0; the collision is over here. So choose n locally and pin
+# the box to it with BJ_STACK_N.
+pick_block() { # $1 host
+  local n fe mw have
+  # Sticky. The box already has containers, a compose project and a registry on its
+  # block, and bluejay-local bakes the ports into NEXT_PUBLIC_API_URL, so silently
+  # moving it strands every one of those. Only move when this laptop cannot forward it.
+  have=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY_FILE" "ubuntu@$1" \
+    "sed -n 's/^STACK_N=//p' ~/bluejay-local/local/.stacks/base.env 2>/dev/null" 2>/dev/null | tr -dc '0-9')
+  if [ -n "$have" ]; then
+    fe=$((3000 + have)); mw=$((8000 + have))
+    if ! port_busy "$fe" && ! port_busy "$mw"; then
+      STACK_N=$have; PORTS="$fe,$mw"
+      [ "$have" = 0 ] || inf "reusing the box's stack block $have (frontend :$fe, middleware :$mw)"
+      return 0
+    fi
+    inf "the box is on block $have but :$fe or :$mw is busy here; moving it"
+  fi
+  for n in $(seq 0 19); do
+    fe=$((3000 + n)); mw=$((8000 + n))
+    # Not `port_busy x && continue`: that returns non-zero when the port is FREE, which
+    # set -e reads as a failure and kills the script with no output at all.
+    if port_busy "$fe" || port_busy "$mw"; then continue; fi
+    STACK_N=$n; PORTS="$fe,$mw"
+    [ "$n" = 0 ] || inf "using stack block $n (frontend :$fe, middleware :$mw); lower ones are in use here"
+    return 0
+  done
+  die "no free port block on this machine; stop something listening on 3000-3019 / 8000-8019"
+}
+
+tunnel_start() { # $1 host
+  local host=$1 p fwd=()
+  tunnel_stop
+  for p in ${PORTS//,/ }; do
+    # Re-check right before binding. pick_block ran earlier and something may have
+    # started since; binding over it is the whole failure mode.
+    if port_busy "$p"; then
+      inf "port $p became busy, not forwarding it"
+      return 1
+    fi
+    fwd+=(-L "127.0.0.1:$p:localhost:$p" -L "[::1]:$p:localhost:$p")
+  done
+  ssh -f -N -M -S "$TUNNEL_SOCK" -o ExitOnForwardFailure=yes \
+      -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 \
+      -i "$KEY_FILE" "${fwd[@]}" "ubuntu@$host" 2>/dev/null || {
+    rm -f "$TUNNEL_SOCK"
+    inf "could not open the ssh tunnel"
+    return 1
+  }
+  return 0
+}
+
+# Ask the box, and ask it for a real answer. A listening socket is NOT the same as a
+# working service: `next dev` binds before it can serve, and a wedged orphan from a
+# previous run holds the port while answering nothing, which made `bj up` hand out a
+# dead link and call it success. An http status, any status, is the real signal.
+open_ports() { # $1 host -> the ports from $PORTS that answer, one per line
+  local ports=${PORTS//,/ }
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+      -i "$KEY_FILE" "ubuntu@$1" \
+      "for p in $ports; do
+         c=\$(curl -s -o /dev/null -m 8 -w '%{http_code}' \"http://localhost:\$p/\" 2>/dev/null)
+         case \"\$c\" in ''|000) ;; *) echo \$p ;; esac
+       done" 2>/dev/null
+}
+
+# next dev compiles before it listens, so a URL printed the moment tmux starts is
+# always a dead link. One shared deadline, not one per port, or two slow services
+# serialise into twice the wait.
+wait_ports() { # $1 host, $2 seconds, rest: ports
+  local host=$1 secs=$2; shift 2
+  local deadline=$((SECONDS + secs)) start=$SECONDS live p pending printed=" "
+  while :; do
+    live=" $(open_ports "$host" | tr '\n' ' ')"
+    pending=""
+    for p in "$@"; do
+      case "$live" in
+        *" $p "*)
+          case "$printed" in
+            *" $p "*) ;;
+            # The URL itself comes from print_urls once everything is up, because it has
+            # to be a localhost address and that means opening the tunnel first.
+            *) inf "$p answering"; printed="$printed$p " ;;
+          esac ;;
+        *) pending="$pending $p" ;;
+      esac
+    done
+    [ -z "$pending" ] && return 0
+    [ $SECONDS -lt $deadline ] || break
+    # A cold box builds container images for several minutes with nothing on a
+    # port yet. Silence there reads as a hang, so show what it is actually doing.
+    if [ $(((SECONDS - start) % 60)) -lt 12 ] && [ $((SECONDS - start)) -gt 40 ]; then
+      inf "$(((SECONDS - start) / 60))m: $(ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$KEY_FILE" "ubuntu@$host" 'tail -1 ~/bluejay-start.log' 2>/dev/null \
+        | tr -d '\r' | cut -c1-90)"
+    fi
+    sleep 10
+  done
+  inf "still not listening after ${secs}s:$pending"
+  inf "why: bj ssh 'tail -40 ~/bluejay-start.log'"
+  return 1
+}
+
+# A box baked before uv and honcho were added has neither, and preflight then fails
+# with a "brew install" hint that cannot work on Linux. Self-heal instead.
+ensure_tools() {
+  ssh -n -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "ubuntu@$1" '
+    export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+    command -v honcho >/dev/null || "$HOME/.local/bin/uv" tool install honcho >/dev/null 2>&1
+    command -v cloudflared >/dev/null || {
+      curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+        && sudo dpkg -i /tmp/cf.deb >/dev/null 2>&1; rm -f /tmp/cf.deb; }
+    grep -q "/home/ubuntu/.local/bin" /etc/environment || \
+      sudo sed -i "s|^PATH=\"|PATH=\"/home/ubuntu/.local/bin:|" /etc/environment
+  ' >/dev/null 2>&1 || inf "could not verify uv/honcho on the box"
+}
+
+# Printing a URL for a port nothing is listening on is how `bj up` sent people to
+# a refused connection and blamed the frontend.
+# Prints localhost URLs, because that is where the tunnel puts them and the only origin
+# the app will style itself on. The check that decides whether to print at all still runs
+# on the box, so a broken tunnel is never mistaken for a broken service.
+print_urls() { # $1 host, $2 stream (1 prints to stdout, anything else to stderr)
+  local host=$1 out=${2:-1} p any= live
+  live=$(open_ports "$host") || true
+  [ -n "$live" ] || return 1
+  tunnel_start "$host" || true
+  for p in $live; do
+    any=1
+    if [ "$out" = 1 ]; then echo "http://localhost:$p"
+    else echo "  http://localhost:$p" >&2; fi
+  done
+  [ -n "$any" ]
+}
+
+# Public https for a port on the box, via a cloudflared quick tunnel.
+#
+# The app sends upgrade-insecure-requests in its CSP for every host that is not localhost,
+# so http://<ec2-host>:3000 loads with every asset upgraded to https against a plain-http
+# port and renders as unstyled Times New Roman. A quick tunnel is real https, so the page
+# renders. It also needs no client, which is the only reason a CI-launched preview box is
+# reachable at all; the ssh tunnel requires a laptop sitting there holding it open.
+#
+# Anyone with the URL can reach it, so this is the app's own login page and nothing more
+# privileged than that. Quick tunnels need no account and no token.
+web_url() { # $1 host, $2 port -> prints the https url, empty if cloudflared is missing
+  local host=$1 p=$2
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+      -i "$KEY_FILE" "ubuntu@$host" "
+    log=~/.bj-web-$p.log
+    pgrep -f 'cloudflared tunnel --url http://localhost:$p\$' >/dev/null 2>&1 || {
+      command -v cloudflared >/dev/null 2>&1 || exit 0
+      nohup cloudflared tunnel --url http://localhost:$p >\$log 2>&1 &
+      for _ in \$(seq 1 40); do
+        grep -qE 'https://[a-z0-9-]+\.trycloudflare\.com' \$log 2>/dev/null && break
+        sleep 1
+      done
+    }
+    grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' \$log 2>/dev/null | tail -1
+  " 2>/dev/null
+}
+
+cmd_url() { # [--public]
+  local host pub= p u; [ "${1:-}" = --public ] && pub=1
+  host="$(instance_field Dns)"
+  [ -n "$host" ] && [ "$(instance_field State)" = running ] || { echo "box not running" >&2; return 1; }
+
+  if [ -z "$pub" ]; then
+    print_urls "$host" || { echo "box is up but no service is listening; 'bj up frontend middleware'" >&2; return 1; }
+    echo "(forwarded over ssh to this machine only; nothing is exposed publicly)" >&2
+    echo "'bj url --public' gives an https link anyone can open" >&2
+    return 0
+  fi
+
+  # The box picks its own block and it need not match this laptop's, so read the block
+  # off the box rather than assuming $PORTS, then confirm the port actually serves.
+  local n; n="$(ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+    -i "$KEY_FILE" "ubuntu@$host" \
+    "sed -n 's/^STACK_N=//p' ~/bluejay-local/local/.stacks/base.env 2>/dev/null" 2>/dev/null | tr -dc '0-9')"
+  p=$((3000 + ${n:-0}))
+  ssh -n -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+    -i "$KEY_FILE" "ubuntu@$host" \
+    "c=\$(curl -s -o /dev/null -m 8 -w '%{http_code}' http://localhost:$p/ 2>/dev/null); case \"\$c\" in ''|000) exit 1 ;; esac" \
+    >/dev/null 2>&1 || { echo "frontend is not answering on $p; 'bj up frontend'" >&2; return 1; }
+  u="$(web_url "$host" "$p")"
+  [ -n "$u" ] || { echo "cloudflared is not on the box, so there is no public url" >&2; return 1; }
+  echo "$u"
+  echo "(public https, anyone with the link reaches the login page; 'bj down' ends it)" >&2
+}
+
+# Provisioning from scratch is ~10 min of apt, npm and github downloads that is
+# identical on every box. Bake it once; `resolve_ami` then prefers the result.
+# Nothing engineer-specific is baked: no repos, no secrets, no authorized_keys.
+cmd_bake() {
+  ensure_key
+  local sg ami id host img
+  sg="$(ensure_sg)"
+  ami="$(aws ssm get-parameters --names "$AMI_PARAM" --query 'Parameters[0].Value' --output text)"
+  local ud; ud="$(mktemp)"; trap 'rm -f "$ud"' RETURN
+  build_userdata > "$ud"
+
+  inf "launching builder from $ami"
+  id="$(aws ec2 run-instances \
+    --image-id "$ami" --instance-type "${BJ_BAKE_TYPE:-m7i-flex.large}" \
+    --key-name "$KEY_NAME" --security-group-ids "$sg" --count 1 \
+    --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+    --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=${BJ_BAKE_GB:-30},VolumeType=gp3,DeleteOnTermination=true,Encrypted=true}" \
+    --user-data "file://$ud" \
+    --tag-specifications \
+      "ResourceType=instance,Tags=[{Key=Name,Value=bluejay-devbox-ami-builder},{Key=bluejay:purpose,Value=eng-612}]" \
+      "ResourceType=volume,Tags=[{Key=bluejay:purpose,Value=eng-612}]" \
+    --query 'Instances[0].InstanceId' --output text)"
+  inf "builder $id"
+
+  aws ec2 wait instance-running --instance-ids "$id"
+  host="$(aws ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].PublicDnsName' --output text)"
+  wait_ssh "$host"
+
+  inf "provisioning; watch with: ssh -i $KEY_FILE ubuntu@$host tail -f /var/log/bj-provision.log"
+  local ok=0
+  for _ in $(seq 1 120); do
+    ssh_q "$host" test -e /var/lib/bj-baked && { ok=1; break; }
+    sleep 15
+  done
+  [ "$ok" = 1 ] || { inf "builder $id left running for debugging"; die "provisioning never finished on $host"; }
+
+  # Strip everything per-instance. Readiness marker included: bj-boot rewrites it
+  # on the new box, so it never claims ready before this boot's setup has run.
+  ssh -n -o StrictHostKeyChecking=accept-new -i "$KEY_FILE" "ubuntu@$host" \
+    'sudo rm -f /var/lib/bj-provisioned /etc/ssh/ssh_host_* && sudo cloud-init clean --logs && sudo truncate -s 0 ~/.ssh/authorized_keys'
+
+  inf "stopping builder"
+  aws ec2 stop-instances --instance-ids "$id" >/dev/null
+  aws ec2 wait instance-stopped --instance-ids "$id"
+
+  img="$(aws ec2 create-image --instance-id "$id" \
+    --name "bluejay-devbox-$(date -u +%Y%m%d-%H%M%S)" \
+    --description "Bluejay devbox base: docker, node 22, python3.11, uv, honcho, just, gh, supabase, dbmate, psql, infisical" \
+    --tag-specifications \
+      "ResourceType=image,Tags=[{Key=Name,Value=bluejay-devbox},{Key=bluejay:devbox-ami,Value=1},{Key=bluejay:purpose,Value=eng-612}]" \
+      "ResourceType=snapshot,Tags=[{Key=bluejay:devbox-ami,Value=1},{Key=bluejay:purpose,Value=eng-612}]" \
+    --query ImageId --output text)"
+  inf "waiting for $img"
+  aws ec2 wait image-available --image-ids "$img"
+  aws ec2 terminate-instances --instance-ids "$id" >/dev/null
+  echo "$img"
+}
+
+# Stopped boxes still bill for their volume, and an abandoned one bills forever.
+# Snapshot before terminating: a snapshot of a mostly-empty 150 GB volume is
+# pennies, and it is the difference between reaping and destroying someone's work.
+cmd_reap() {
+  local days="${BJ_REAP_DAYS:-3}" go=0 now cutoff
+  [ "${1:-}" = "--yes" ] && go=1
+  now=$(date +%s); cutoff=$(( now - days * 86400 ))
+
+  aws ec2 describe-instances \
+    --filters "Name=tag-key,Values=bluejay:devbox-owner" "Name=instance-state-name,Values=stopped" \
+    --query 'Reservations[].Instances[].[InstanceId,StateTransitionReason,Tags[?Key==`bluejay:devbox-owner`].Value|[0],Tags[?Key==`bluejay:keep`].Value|[0],BlockDeviceMappings[0].Ebs.VolumeId]' \
+    --output text | while read -r id reason owner keep vol; do
+      [ "$keep" != None ] && { echo "keep   $id ($owner)"; continue; }
+      # "User initiated (2026-08-26 19:00:00 GMT)"
+      local when ts
+      when=$(sed -n 's/.*(\(.*\) GMT)/\1/p' <<<"$reason")
+      [ -n "$when" ] || { echo "skip   $id ($owner) no stop time"; continue; }
+      ts=$(date -j -f "%Y-%m-%d %H:%M:%S" "$when" +%s 2>/dev/null || date -d "$when" +%s 2>/dev/null)
+      [ -n "$ts" ] && [ "$ts" -lt "$cutoff" ] || { echo "keep   $id ($owner) stopped $when"; continue; }
+
+      if [ $go = 0 ]; then
+        echo "WOULD  $id ($owner) stopped $when, snapshot $vol then terminate"
+        continue
+      fi
+      echo "reap   $id ($owner) stopped $when"
+      aws ec2 create-snapshot --volume-id "$vol" \
+        --description "bj reap $owner $when" \
+        --tag-specifications "ResourceType=snapshot,Tags=[{Key=bluejay:devbox-owner,Value=$owner},{Key=bluejay:reaped,Value=$when}]" \
+        --query SnapshotId --output text
+      aws ec2 terminate-instances --instance-ids "$id" --query 'TerminatingInstances[0].CurrentState.Name' --output text
+    done
+}
+
+# test-sg-prune.sh sources this file for stale_rules and must not dispatch.
+[ -n "${BJ_LIB:-}" ] && return 0
+
+case "${1:-}" in
+  up) shift; cmd_up "$@" ;;
+  bake) shift; cmd_bake "$@" ;;
+  reap) shift; cmd_reap "$@" ;;
+  ssh) shift; cmd_ssh "$@" ;;
+  down) shift; cmd_down "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  url) shift; cmd_url "$@" ;;
+  branches) shift; [ -n "${1:-}" ] || die "usage: bj branches ENG-123"; preview_branches "$1" ;;
+  *) echo "usage: bj {up [service...]|ssh|down|status|url|branches ENG-123|bake|reap [--yes]}" >&2; exit 1 ;;
+esac

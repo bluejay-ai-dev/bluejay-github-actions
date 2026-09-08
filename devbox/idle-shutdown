@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Shuts the box down when nobody is on it. This is the whole cost model: the box
+# costs nothing stopped, so every minute of false "busy" is money and every false
+# "idle" is a lost background job. Installed at /usr/local/bin/bj-idle-shutdown.
+#
+# ---- tunables ----------------------------------------------------------------
+IDLE_CPU_PCT=10      # below this much CPU busy, the box counts as idle
+IDLE_MINUTES=30      # consecutive idle minutes before shutdown
+# ------------------------------------------------------------------------------
+#
+# Idle time is accumulated from wall-clock deltas, not from a tick counter, so the
+# systemd timer interval can change without retuning anything here.
+# `touch /var/lib/bj-idle/hold` pins the box up for a detached job that is waiting
+# on the network (low CPU, no ssh session) and would otherwise be killed.
+set -euo pipefail
+
+# Seams so the logic below can be tested without powering a box off. Both default
+# to the real thing; only the test overrides them.
+PROC_STAT="${BJ_PROC_STAT:-/proc/stat}"
+POWEROFF_CMD="${BJ_POWEROFF_CMD:-systemctl poweroff}"
+SESSION_CMD="${BJ_SESSION_CMD:-who}"
+
+STATE_DIR="${BJ_STATE_DIR:-/var/lib/bj-idle}"
+STATE="$STATE_DIR/state"
+mkdir -p "$STATE_DIR"
+
+read -r _ u n s i rest < "$PROC_STAT"
+now_idle=$i
+now_total=0
+for v in $u $n $s $i $rest; do now_total=$((now_total + v)); done
+now=$(date +%s)
+
+if [ ! -f "$STATE" ]; then
+  echo "$now $now_total $now_idle 0" > "$STATE"
+  exit 0
+fi
+read -r last last_total last_idle idle_secs < "$STATE"
+
+elapsed=$((now - last))
+dtotal=$((now_total - last_total))
+# clock jump, counter wrap, or a resume from stop: no usable delta, start over
+if [ "$elapsed" -le 0 ] || [ "$dtotal" -le 0 ]; then
+  echo "$now $now_total $now_idle 0" > "$STATE"
+  exit 0
+fi
+
+busy_pct=$(awk -v d="$dtotal" -v di="$((now_idle - last_idle))" 'BEGIN{printf "%.1f", 100*(1-di/d)}')
+sessions=$($SESSION_CMD | wc -l)
+
+if [ -e "$STATE_DIR/hold" ] || [ "$sessions" -gt 0 ] \
+   || awk -v b="$busy_pct" -v t="$IDLE_CPU_PCT" 'BEGIN{exit !(b>=t)}'; then
+  idle_secs=0
+else
+  idle_secs=$((idle_secs + elapsed))
+fi
+echo "$now $now_total $now_idle $idle_secs" > "$STATE"
+
+if [ "$idle_secs" -ge $((IDLE_MINUTES * 60)) ]; then
+  logger -t bj-idle "idle ${idle_secs}s (cpu ${busy_pct}%, ${sessions} sessions) - shutting down"
+  # wall so an ssh session that reconnects mid-shutdown knows why
+  wall "bj-idle: no activity for $IDLE_MINUTES min, shutting down. 'bj up' to come back." 2>/dev/null || true
+  exec $POWEROFF_CMD
+fi
+
+logger -t bj-idle "cpu ${busy_pct}% sessions ${sessions} idle ${idle_secs}s/$((IDLE_MINUTES * 60))s"

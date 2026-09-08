@@ -1,0 +1,54 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyLookups",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances","ec2:DescribeInstanceStatus","ec2:DescribeImages",
+                 "ec2:DescribeKeyPairs","ec2:DescribeSecurityGroups","ec2:DescribeSubnets",
+                 "ec2:DescribeVpcs","ec2:DescribeTags","ec2:DescribeVolumes",
+                 "ec2:DescribeIamInstanceProfileAssociations","ssm:GetParameters"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OnlyPreviewBoxes",
+      "Effect": "Allow",
+      "Action": ["ec2:StartInstances","ec2:StopInstances","ec2:TerminateInstances",
+                 "ec2:AssociateIamInstanceProfile"],
+      "Resource": "*",
+      "Condition": {"StringLike": {"ec2:ResourceTag/bluejay:preview-ticket": "ENG-*"}}
+    },
+    {
+      "Sid": "CreateOnlyPreviewBoxes",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:148660429236:instance/*",
+      "Condition": {
+        "StringLike": {"aws:RequestTag/bluejay:preview-ticket": "ENG-*"},
+        "StringEquals": {"ec2:InstanceType": "m7i-flex.2xlarge"}
+      }
+    },
+    {
+      "Sid": "CreateSupportingResources",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": ["arn:aws:ec2:*::image/*","arn:aws:ec2:*:148660429236:subnet/*",
+                   "arn:aws:ec2:*:148660429236:security-group/*","arn:aws:ec2:*:148660429236:volume/*",
+                   "arn:aws:ec2:*:148660429236:network-interface/*","arn:aws:ec2:*:148660429236:key-pair/*"]
+    },
+    {
+      "Sid": "TagOnCreate",
+      "Effect": "Allow",
+      "Action": "ec2:CreateTags",
+      "Resource": "*",
+      "Condition": {"StringEquals": {"ec2:CreateAction": "RunInstances"}}
+    },
+    {
+      "Sid": "PassOnlyTheDevboxRole",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::148660429236:role/bluejay-devbox",
+      "Condition": {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}}
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+name: devbox-reap
+on:
+  schedule:
+    - cron: '0 8 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: actually snapshot and terminate
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.DEVBOX_REAP_ROLE }}
+          aws-region: us-east-1
+      - env:
+          BJ_REAP_DAYS: 3
+        run: |
+          if [ "${{ inputs.apply }}" = true ]; then
+            devbox/bj reap --yes | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            devbox/bj reap | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
