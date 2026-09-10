@@ -52,7 +52,18 @@ jobs:
             --json repository,number,title \
             -q '.[] | [.repository.name, (.number|tostring), .title] | @tsv' \
             > raw.tsv || { echo "::error::sibling search failed; refusing to pass without knowing"; exit 1; }
-          awk -F'\t' -v id="$ID" 'toupper($3) ~ ("\\<" toupper(id) "\\>")' raw.tsv > siblings.tsv
+          # The Linear cross-check has to see every state. An attachment stays on the ticket
+          # after its PR merges, so comparing against open PRs alone makes every shipped
+          # ticket look like it is hiding work.
+          gh search prs --owner "$OWNER" --match title "$ID" --limit 100 \
+            --json repository,number,title \
+            -q '.[] | [.repository.name, (.number|tostring), .title] | @tsv' \
+            > raw_all.tsv || { echo "::error::sibling search failed; refusing to pass without knowing"; exit 1; }
+          # Not \< \>: the runner's awk is mawk, which has no word boundaries, so that
+          # pattern matched nothing and the sibling check was inert.
+          pat="(^|[^A-Z0-9])$(printf '%s' "$ID" | tr '[:lower:]' '[:upper:]')([^0-9]|$)"
+          awk -F'\t' -v p="$pat" 'toupper($3) ~ p' raw.tsv > siblings.tsv
+          awk -F'\t' -v p="$pat" 'toupper($3) ~ p' raw_all.tsv > siblings_all.tsv
 
           # Kaleb's cross-check: Linear attaches PRs to the issue independently, so if it
           # knows about more than the search found, a PR exists the reviewer cannot see.
@@ -78,7 +89,8 @@ jobs:
                       | select(test("github\\.com/[^/]+/[^/]+/pull/[0-9]+"))]
                      | unique | .[]' <<<"$resp" | sort)
           searched=$(cut -f1,2 siblings.tsv | awk -F'\t' '{printf "https://github.com/'"$OWNER"'/%s/pull/%s\n",$1,$2}' | sort)
-          missing=$(comm -23 <(printf '%s\n' "$linear_prs" | sed '/^$/d') <(printf '%s\n' "$searched" | sed '/^$/d'))
+          known=$(cut -f1,2 siblings_all.tsv | awk -F'\t' '{printf "https://github.com/'"$OWNER"'/%s/pull/%s\n",$1,$2}' | sort)
+          missing=$(comm -23 <(printf '%s\n' "$linear_prs" | sed '/^$/d') <(printf '%s\n' "$known" | sed '/^$/d'))
           if [ -n "$missing" ]; then
             echo "::error::Linear has PRs on $ID that the search did not find:"
             printf '%s\n' "$missing" | sed 's/^/  /'
