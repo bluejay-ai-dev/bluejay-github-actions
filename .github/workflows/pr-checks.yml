@@ -37,6 +37,7 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ secrets.SANDBOX_GH_TOKEN }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
           ID: ${{ needs.ticket.outputs.id }}
           SELF: ${{ github.event.repository.name }}
           NUM: ${{ github.event.pull_request.number }}
