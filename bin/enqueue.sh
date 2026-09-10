@@ -13,7 +13,7 @@
 #
 # Exit: 0 merged | 1 batch not ready | 2 usage | 3 a merge failed and was reverted
 #
-# Squash merges only, so a revert is one commit and not a -m 1 guess.
+# Squash merges are not enforced yet, so a revert checks the parent count first.
 set -uo pipefail
 
 ORG=${ORG:-bluejay-ai-dev}

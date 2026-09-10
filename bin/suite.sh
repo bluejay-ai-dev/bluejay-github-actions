@@ -5,7 +5,7 @@
 #   suite.sh <part> [args]                  one part, for debugging
 #   parts: preflight sha creds signup text sms traces browser bluejayai outbound inbound redteam uptime
 #
-# Exit: 0 pass | 1 regression | 2 usage | 3 fixtures or prereqs missing | 4 provider config red
+# Exit: 0 pass | 1 regression | 2 usage | 3 fixtures or prereqs missing | 4 provider config red | 5 amber
 #
 # It asserts status class, never agent behaviour. Four turns of nonsense passes on purpose:
 # this gates infrastructure, and evals_tests.yml owns whether the answers were any good.
