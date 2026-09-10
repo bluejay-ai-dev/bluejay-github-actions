@@ -125,7 +125,12 @@ jobs:
       - uses: actions/checkout@v4
       - run: |
           if [ -f Dockerfile ]; then docker build -q -t check .; else echo "no Dockerfile"; fi
-      - run: |
+      - env:
+          # npm ci triggers a prisma generate postinstall in some repos, which throws on a
+          # missing DIRECT_URL before any build step runs.
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+          DIRECT_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+        run: |
           if [ -f package.json ]; then
             npm ci
             npm run build --if-present
@@ -154,6 +159,9 @@ jobs:
       RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
       RAILWAY_PROD_SERVICE: ${{ vars.RAILWAY_PROD_SERVICE }}
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      # prisma.config resolves DIRECT_URL too and throws if it is unset, even though
+      # generate never connects. Same throwaway postgres as above.
+      DIRECT_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
       INFISICAL_DEB_SHA256: 43e5c251ce5ba078f3751f76971a816f7b9f99c2fe4a938848af5cf5b087bf3c
     steps:
       - uses: actions/checkout@v4
