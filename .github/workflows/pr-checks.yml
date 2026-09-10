@@ -43,7 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::SANDBOX_GH_TOKEN is not set, so sibling PRs cannot be checked. This gate exists to catch a half-shipped feature, so it fails rather than passing blind."
+            echo "::error::SANDBOX_GH_TOKEN is not set, so sibling PRs cannot be checked"
             exit 1
           fi
           # Code search tokenizes on the hyphen, so re-filter the titles ourselves.
@@ -56,13 +56,11 @@ jobs:
           # Kaleb's cross-check: Linear attaches PRs to the issue independently, so if it
           # knows about more than the search found, a PR exists the reviewer cannot see.
           if [ -z "${LINEAR_API_KEY:-}" ]; then
-            echo "::error::LINEAR_API_KEY is not set, so the Linear cross-check cannot run. It is the only thing that catches a sibling PR the search cannot see, so it fails rather than passing blind."
+            echo "::error::LINEAR_API_KEY is not set, so the Linear cross-check cannot run"
             exit 1
           fi
           q='query($i:String!){issue(id:$i){attachments{nodes{url}}}}'
-          # A bad token, a rate limit or a deleted ticket all return a body with no issue in
-          # it. Read as an empty attachment list that is "Linear knows of no PRs", which
-          # passes, so every failure has to be rejected explicitly before the comparison.
+          # No issue in the body reads as "Linear knows of no PRs", which passes.
           resp=$(curl -fsS --max-time 20 https://api.linear.app/graphql \
             -H "Authorization: $LINEAR_API_KEY" -H 'content-type: application/json' \
             -d "$(jq -nc --arg q "$q" --arg i "$ID" '{query:$q,variables:{i:$i}}')") \
