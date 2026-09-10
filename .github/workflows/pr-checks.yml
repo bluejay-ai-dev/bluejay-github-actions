@@ -60,12 +60,24 @@ jobs:
             exit 1
           fi
           q='query($i:String!){issue(id:$i){attachments{nodes{url}}}}'
-          linear_prs=$(curl -sS --max-time 20 https://api.linear.app/graphql \
+          # A bad token, a rate limit or a deleted ticket all return a body with no issue in
+          # it. Read as an empty attachment list that is "Linear knows of no PRs", which
+          # passes, so every failure has to be rejected explicitly before the comparison.
+          resp=$(curl -fsS --max-time 20 https://api.linear.app/graphql \
             -H "Authorization: $LINEAR_API_KEY" -H 'content-type: application/json' \
-            -d "$(jq -nc --arg q "$q" --arg i "$ID" '{query:$q,variables:{i:$i}}')" \
-            | jq -r '[.data.issue.attachments.nodes[]?.url
+            -d "$(jq -nc --arg q "$q" --arg i "$ID" '{query:$q,variables:{i:$i}}')") \
+            || { echo "::error::Linear API call failed, so the cross-check cannot run"; exit 1; }
+          if [ "$(jq -r '(.errors // []) | length' <<<"$resp")" != 0 ]; then
+            echo "::error::Linear rejected the query: $(jq -rc '.errors' <<<"$resp")"
+            exit 1
+          fi
+          if [ "$(jq -r 'if .data.issue == null then "null" else "ok" end' <<<"$resp")" = null ]; then
+            echo "::error::$ID does not exist in Linear"
+            exit 1
+          fi
+          linear_prs=$(jq -r '[.data.issue.attachments.nodes[]?.url
                       | select(test("github\\.com/[^/]+/[^/]+/pull/[0-9]+"))]
-                     | unique | .[]' 2>/dev/null | sort)
+                     | unique | .[]' <<<"$resp" | sort)
           searched=$(cut -f1,2 siblings.tsv | awk -F'\t' '{printf "https://github.com/'"$OWNER"'/%s/pull/%s\n",$1,$2}' | sort)
           missing=$(comm -23 <(printf '%s\n' "$linear_prs" | sed '/^$/d') <(printf '%s\n' "$searched" | sed '/^$/d'))
           if [ -n "$missing" ]; then
