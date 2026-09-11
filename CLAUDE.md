@@ -55,7 +55,22 @@ success is how the sibling gate passed batches nobody had validated.
 **`need` inside `$( )` exits the subshell, not the script.** Write
 `x=$(need FOO) || return $E_FIXTURE`.
 
-**Squash merges only**, so a revert is one commit and not a `-m 1` guess.
+**Squash is NOT enforced.** All nine repos still allow merge commits, so `enqueue.sh`
+counts a commit's parents and passes `-m 1` only when it has two. Do not simplify that away
+until a ruleset actually enforces squash.
+
+**The runner's awk is mawk, which has no `\<` `\>` word boundaries.** A filter using them
+matched zero rows, so the cross-repo sibling check silently passed with `found=0` for its
+whole life. Use `(^|[^A-Z0-9])ID([^0-9]|$)`. This is the single worst bug this gate has had,
+and it looked healthy the entire time.
+
+**Compare like with like against Linear.** Attachments stay on a ticket after its PR merges,
+so comparing them to open PRs only makes every shipped ticket look like it is hiding work.
+The search side has to span every state.
+
+**Prisma needs `DIRECT_URL` as well as `DATABASE_URL`.** `prisma.config` resolves it and
+throws when unset even though `generate` never connects, which killed `codegen` with a bare
+exit 2 and no message, and killed `build` inside `npm ci`'s postinstall.
 
 ## Exit codes, shared by suite.sh and enqueue.sh
 
@@ -63,10 +78,35 @@ success is how the sibling gate passed batches nobody had validated.
 red, `5` amber. Fixture-missing is deliberately not a regression: if a data rebuild turns a
 gate red, people learn to override it, and then it is worse than no gate.
 
+## How the callers are wired right now
+
+Every caller reads `pr-checks.yml@main`, not a pinned sha, so anything merged here reaches
+all eight repos immediately. That is deliberate: a pin froze the gate at the commit it
+shipped on. The tradeoff is real, `secrets: inherit` means whoever can push this repo's main
+can change the code receiving every secret in those repos. It is acceptable only while the
+`gating-trial` label keeps the gate off ordinary PRs. Pin a sha again before that label
+comes off.
+
+A re-run replays the workflow version pinned when the run was created, so `@main` does not
+re-resolve on a re-run. Push an empty commit to get a fresh one.
+
+## Merging from the dashboard
+
+The internal dashboard has a **Releases** page under Development. Search a ticket, a number,
+a repo or words from a PR title, drag the sequence to change merge order, and dispatch with
+dry run on by default. It fires this repo's `enqueue` workflow, so it is the same code path
+as the Actions tab. Reads use `GITHUB_TOKEN`, the dispatch uses `BLUEBIC_DISPATCH_TOKEN`,
+which is `actions:write` on this repo only and cannot read anything else.
+
 ## Before anything can actually run
 
-- Org secrets `LINEAR_API_KEY`, `INFISICAL_TOKEN`, `RAILWAY_TOKEN`; `suite.sh preflight` is
-  the manifest and cannot drift from the code.
+- `LINEAR_API_KEY` and `SANDBOX_GH_TOKEN` are set on all eight app repos. Without them the
+  gate fails closed and says which one is missing, rather than passing blind.
+- `INFISICAL_TOKEN` and `RAILWAY_TOKEN` are still unset. The build job skips the Infisical
+  step when absent, so this degrades rather than breaking.
+- `suite.sh preflight` is the manifest for the suite's own fixtures and cannot drift from
+  the code. `TEST_SUITE_*` does not exist yet, which is why the nightly schedule is
+  commented out.
 - A GitHub App as the only bypass actor on the main ruleset, `MERGE_APP_ID` and
   `MERGE_APP_PRIVATE_KEY`. Without it `enqueue check` works and `enqueue run` cannot merge.
 - Neither middleware nor the frontend exposes a deployed SHA, so `suite.sh sha` exits 3
