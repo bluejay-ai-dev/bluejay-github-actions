@@ -72,10 +72,27 @@ prs_for() { # <ticket> -> "<repo>#<num> <url>" per line
     -q ".[] | select(.title | test(\"\\\\b$1\\\\b\")) | \"\(.repository.name)#\(.number) \(.url)\"" 2>/dev/null | sort
 }
 
-links_for() { # <ticket> -> indented list, empty when the search fails
-  local out; out=$(prs_for "$1")
-  [ -n "$out" ] || return 0
-  printf '\n\n'; while read -r ref url; do printf '%s\n' "$url"; done <<<"$out"
+# Asked rather than built from a workspace slug, so it stays right if the slug changes.
+linear_url() { # <ticket> -> issue url, empty when unknown
+  [ -n "${LINEAR_API_KEY:-}" ] || return 0
+  local q='query($i:String!){issue(id:$i){url}}'
+  curl -sS --max-time 15 https://api.linear.app/graphql \
+    -H "Authorization: $LINEAR_API_KEY" -H 'content-type: application/json' \
+    -d "$(jq -nc --arg q "$q" --arg i "$1" '{query:$q,variables:{i:$i}}')" 2>/dev/null \
+    | jq -r '.data.issue.url // empty' 2>/dev/null
+}
+
+links_for() { # <ticket> -> labelled Ticket and PRs blocks, each link on its own line
+  local out="" url prs
+  url=$(linear_url "$1")
+  [ -n "$url" ] && out="$out"$'\n'"Ticket:"$'\n'"$url"
+  prs=$(prs_for "$1")
+  if [ -n "$prs" ]; then
+    [ -n "$out" ] && out="$out"$'\n'
+    out="$out"$'\n'"PRs:"
+    while read -r _ref url; do out="$out"$'\n'"$url"; done <<<"$prs"
+  fi
+  printf '%s' "$out"
 }
 
 run_link() {
