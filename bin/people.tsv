@@ -1,4 +1,13 @@
-# github login	slack user id	name
+# github login	slack user id
 # cubic's resolver returns nothing for this org, so the mapping is explicit and committed.
 # A missing row is not an error: the bot posts to the channel instead of a DM.
-lorenzotaylor-bluejay	U0B8HCA4C5V	Lorenzo Taylor
+apulapaka6	U0A72DEJ2CE
+farazmsiddiqi	U08M0C2EJQJ
+ibakurov	U0C2FMDETNY
+khicken	U0B85RWSPHN
+lorenzotaylor-bluejay	U0B8HCA4C5V
+rohanvasishth	U08M0C49B3L
+RohitValmeekam	U0A7122NTC5
+ronniel-svg	U0B14PU5L6A
+ryanbishop123	U0BATDF9CS0
+yash-savalia	U091H78U9DG
