@@ -145,8 +145,11 @@ rollback() { # <"repo:sha" ...>
     local parents m=""
     parents=$(gh api "repos/$ORG/$repo/commits/$sha" --jq '.parents | length' 2>/dev/null || echo 1)
     [ "${parents:-1}" -gt 1 ] && m="-m 1"
+    # A fresh clone has no identity and the runner has no global one, so revert dies
+    # with "Committer identity unknown" before it ever reaches the push.
     if git clone -q --depth 20 "https://x-access-token:${GH_TOKEN}@github.com/$ORG/$repo" "$d" 2>/dev/null \
-       && git -C "$d" revert --no-edit $m "$sha" >/dev/null 2>&1 \
+       && git -C "$d" -c user.email=releases@getbluejay.ai -c user.name="bluejay releases" \
+              revert --no-edit $m "$sha" >/dev/null 2>&1 \
        && git -C "$d" push -q origin HEAD:main 2>/dev/null; then
       say "  reverted $repo $sha"
       ROLLBACK_OK="$ROLLBACK_OK $repo"
