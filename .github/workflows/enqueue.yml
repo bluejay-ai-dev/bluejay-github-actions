@@ -58,6 +58,10 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           ORG: ${{ github.repository_owner }}
           CHECK_ONLY: ${{ inputs.check_only }}
+          # notify.sh inherits this step's environment. Without these it takes its own
+          # non-fatal early exits and the batch merges having told nobody.
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
           if [ "$CHECK_ONLY" = "true" ]; then
             bin/enqueue.sh check "$TICKET" "$ORDER" | tee /tmp/enqueue.log
