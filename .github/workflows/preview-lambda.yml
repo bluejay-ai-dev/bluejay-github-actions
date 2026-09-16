@@ -1,0 +1,135 @@
+name: preview-lambda
+
+# Deploys a PR's lambda so a preview runs the code in the PR, not the shared sandbox copy.
+#
+# One function per PR, cloned from the matching sandbox function. Lambda bills per
+# invocation, so an idle preview function costs nothing, which is why this is a function
+# per PR rather than aliases over a shared one. Publishing versions of the shared function
+# would mean writing to its $LATEST, and a preview must never disturb sandbox.
+#
+# Outputs the function name so the caller can hand it to the preview environment as
+# LAMBDA_FUNCTION_NAME or TEXT_AGENT_LAMBDA_FUNCTION_NAME.
+
+on:
+  workflow_call:
+    inputs:
+      repo:      { required: true, type: string }   # calling repo, e.g. evals
+      pr:        { required: true, type: string }
+      sha:       { required: true, type: string }
+      action:    { required: true, type: string }   # opened/synchronize/closed
+    outputs:
+      function:
+        description: 'The PR lambda, empty when torn down or not applicable'
+        value: ${{ jobs.deploy.outputs.function }}
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: us-west-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      function: ${{ steps.out.outputs.function }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bluejay-ai-dev/${{ inputs.repo }}
+          ref: ${{ inputs.sha }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
+          aws-region: us-west-1
+
+      - name: Resolve names
+        id: names
+        env:
+          REPO: ${{ inputs.repo }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::bad pr number"; exit 1; }
+          # The repo is not the lambda: evals deploys as evaluator.
+          case "$REPO" in
+            evals)              base=evaluator ;;
+            text_agent)         base=text_agent ;;
+            livekit_dispatcher) base=livekit_dispatcher ;;
+            *) echo "no lambda for $REPO"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          {
+            echo "base=$base"
+            echo "src=sandbox_$base"
+            echo "fn=pr${PR}_$base"
+            echo "ecr=sandbox_$base"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Tear down
+        if: steps.names.outputs.skip != '1' && inputs.action == 'closed'
+        env:
+          FN: ${{ steps.names.outputs.fn }}
+          ECR: ${{ steps.names.outputs.ecr }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          aws lambda delete-function --function-name "$FN" 2>/dev/null && echo "deleted $FN" || echo "$FN was not there"
+          aws ecr batch-delete-image --repository-name "$ECR" --image-ids "imageTag=pr-$PR" >/dev/null 2>&1 || true
+
+      - name: Build, push and deploy
+        if: steps.names.outputs.skip != '1' && inputs.action != 'closed'
+        env:
+          SRC: ${{ steps.names.outputs.src }}
+          FN: ${{ steps.names.outputs.fn }}
+          ECR: ${{ steps.names.outputs.ecr }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          acct=148660429236
+          registry="$acct.dkr.ecr.$AWS_REGION.amazonaws.com"
+          uri="$registry/$ECR:pr-$PR"
+
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$registry" >/dev/null
+
+          # The sandbox functions are arm64, so the image has to be too or the function
+          # fails at first invoke rather than at deploy.
+          docker buildx create --use --name preview >/dev/null 2>&1 || docker buildx use preview
+          docker buildx build --platform linux/arm64 -t "$uri" --push . \
+            || { echo "::error::image build failed"; exit 1; }
+
+          # Clone the sandbox function's shape so the preview behaves like sandbox: same
+          # role, memory, timeout and variables. Only the image differs.
+          cfg=$(aws lambda get-function-configuration --function-name "$SRC")
+          role=$(jq -r .Role <<<"$cfg")
+          timeout=$(jq -r .Timeout <<<"$cfg")
+          mem=$(jq -r .MemorySize <<<"$cfg")
+          jq -c '{Variables: (.Environment.Variables // {})}' <<<"$cfg" > env.json
+
+          if aws lambda get-function --function-name "$FN" >/dev/null 2>&1; then
+            aws lambda update-function-code --function-name "$FN" --image-uri "$uri" >/dev/null
+            aws lambda wait function-updated --function-name "$FN"
+            aws lambda update-function-configuration --function-name "$FN" \
+              --timeout "$timeout" --memory-size "$mem" --environment "file://env.json" >/dev/null
+          else
+            aws lambda create-function --function-name "$FN" \
+              --package-type Image --code "ImageUri=$uri" --role "$role" \
+              --architectures arm64 --timeout "$timeout" --memory-size "$mem" \
+              --environment "file://env.json" \
+              --tags "bluejay:preview-pr=$PR,bluejay:preview-repo=${{ inputs.repo }}" >/dev/null
+          fi
+          aws lambda wait function-active-v2 --function-name "$FN"
+          echo "deployed $FN from $uri"
+
+      - name: Output
+        id: out
+        env:
+          FN: ${{ steps.names.outputs.fn }}
+        run: |
+          if [ "${{ steps.names.outputs.skip }}" = "1" ] || [ "${{ inputs.action }}" = "closed" ]; then
+            echo "function=" >> "$GITHUB_OUTPUT"
+          else
+            echo "function=$FN" >> "$GITHUB_OUTPUT"
+          fi
