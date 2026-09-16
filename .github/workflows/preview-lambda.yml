@@ -17,6 +17,9 @@ on:
       pr:        { required: true, type: string }
       sha:       { required: true, type: string }
       action:    { required: true, type: string }   # opened/synchronize/closed
+    secrets:
+      RAILWAY_TOKEN:    { required: true }
+      PREVIEW_GH_TOKEN: { required: true }
     outputs:
       function:
         description: 'The PR lambda, empty when torn down or not applicable'
@@ -34,18 +37,42 @@ jobs:
     outputs:
       function: ${{ steps.out.outputs.function }}
     steps:
+      # Same `preview` label as preview-ticket.yml. Without this a lambda repo would
+      # build and push an image on every PR, which is the half that costs money.
+      - name: Does this PR want a preview
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+          REPO: ${{ inputs.repo }}
+          PR: ${{ inputs.pr }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          has=$(gh pr view "$PR" -R "bluejay-ai-dev/$REPO" --json labels \
+                -q '[.labels[].name] | index("preview") // "no"')
+          # closed always runs, so an unlabelled teardown still removes the function.
+          if [ "$ACTION" = closed ] || [ "$has" != no ]; then
+            echo "go=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "no preview label, nothing to build"
+            echo "go=0" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == '1'
         with:
           repository: bluejay-ai-dev/${{ inputs.repo }}
           ref: ${{ inputs.sha }}
 
       - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.gate.outputs.go == '1'
         with:
           role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
           aws-region: ${{ steps.names.outputs.region || 'us-west-1' }}
 
       - name: Resolve names
         id: names
+        if: steps.gate.outputs.go == '1'
         env:
           REPO: ${{ inputs.repo }}
           PR: ${{ inputs.pr }}
@@ -71,7 +98,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Tear down
-        if: steps.names.outputs.skip != '1' && inputs.action == 'closed'
+        if: steps.gate.outputs.go == '1' && steps.names.outputs.skip != '1' && inputs.action == 'closed'
         env:
           FN: ${{ steps.names.outputs.fn }}
           ECR: ${{ steps.names.outputs.ecr }}
@@ -83,7 +110,7 @@ jobs:
           aws ecr batch-delete-image --repository-name "$ECR" --image-ids "imageTag=pr-$PR" >/dev/null 2>&1 || true
 
       - name: Build, push and deploy
-        if: steps.names.outputs.skip != '1' && inputs.action != 'closed'
+        if: steps.gate.outputs.go == '1' && steps.names.outputs.skip != '1' && inputs.action != 'closed'
         env:
           SRC: ${{ steps.names.outputs.src }}
           FN: ${{ steps.names.outputs.fn }}
@@ -132,7 +159,7 @@ jobs:
       # service. The preview that should use this lambda is the one belonging to the
       # ticket's middleware PR, so find it by ticket and override the one variable.
       - name: Point the ticket's preview at this lambda
-        if: steps.names.outputs.skip != '1'
+        if: steps.gate.outputs.go == '1' && steps.names.outputs.skip != '1'
         env:
           GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
           RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
@@ -177,7 +204,7 @@ jobs:
         env:
           FN: ${{ steps.names.outputs.fn }}
         run: |
-          if [ "${{ steps.names.outputs.skip }}" = "1" ] || [ "${{ inputs.action }}" = "closed" ]; then
+          if [ "${{ steps.gate.outputs.go }}" != "1" ] || [ "${{ steps.names.outputs.skip }}" = "1" ] || [ "${{ inputs.action }}" = "closed" ]; then
             echo "function=" >> "$GITHUB_OUTPUT"
           else
             echo "function=$FN" >> "$GITHUB_OUTPUT"
