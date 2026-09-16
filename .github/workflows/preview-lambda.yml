@@ -26,8 +26,6 @@ permissions:
   contents: read
   id-token: write
 
-env:
-  AWS_REGION: us-west-1
 
 jobs:
   deploy:
@@ -44,7 +42,7 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
-          aws-region: us-west-1
+          aws-region: ${{ steps.names.outputs.region || 'us-west-1' }}
 
       - name: Resolve names
         id: names
@@ -55,17 +53,21 @@ jobs:
           set -euo pipefail
           [[ "$PR" =~ ^[0-9]+$ ]] || { echo "::error::bad pr number"; exit 1; }
           # The repo is not the lambda: evals deploys as evaluator.
+          # base, the function cloned from, its ECR repo, and the region. emails-lambda is
+          # the odd one: us-east-1, dev-/prod- naming, and an unprefixed ECR repo.
           case "$REPO" in
-            evals)              base=evaluator ;;
-            text_agent)         base=text_agent ;;
-            livekit_dispatcher) base=livekit_dispatcher ;;
+            evals)              base=evaluator;          src=sandbox_evaluator;          ecr=sandbox_evaluator;          region=us-west-1 ;;
+            text_agent)         base=text_agent;         src=sandbox_text_agent;         ecr=sandbox_text_agent;         region=us-west-1 ;;
+            livekit_dispatcher) base=livekit_dispatcher; src=sandbox_livekit_dispatcher; ecr=sandbox_livekit_dispatcher; region=us-west-1 ;;
+            emails-lambda)      base=email;              src=dev-email;                  ecr=bluejay-email-lambda;       region=us-east-1 ;;
             *) echo "no lambda for $REPO"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
           {
             echo "base=$base"
-            echo "src=sandbox_$base"
+            echo "src=$src"
             echo "fn=pr${PR}_$base"
-            echo "ecr=sandbox_$base"
+            echo "ecr=$ecr"
+            echo "region=$region"
           } >> "$GITHUB_OUTPUT"
 
       - name: Tear down
@@ -73,6 +75,7 @@ jobs:
         env:
           FN: ${{ steps.names.outputs.fn }}
           ECR: ${{ steps.names.outputs.ecr }}
+          AWS_DEFAULT_REGION: ${{ steps.names.outputs.region }}
           PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
@@ -85,11 +88,13 @@ jobs:
           SRC: ${{ steps.names.outputs.src }}
           FN: ${{ steps.names.outputs.fn }}
           ECR: ${{ steps.names.outputs.ecr }}
+          REGION: ${{ steps.names.outputs.region }}
+          AWS_DEFAULT_REGION: ${{ steps.names.outputs.region }}
           PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
           acct=148660429236
-          registry="$acct.dkr.ecr.$AWS_REGION.amazonaws.com"
+          registry="$acct.dkr.ecr.$REGION.amazonaws.com"
           uri="$registry/$ECR:pr-$PR"
 
           aws ecr get-login-password | docker login --username AWS --password-stdin "$registry" >/dev/null
