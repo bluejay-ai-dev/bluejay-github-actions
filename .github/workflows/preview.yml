@@ -1,0 +1,82 @@
+name: preview
+
+# Terminates preview boxes whose ticket has no open PR left.
+#
+# Terminate, not stop. A stopped box still bills its 150 GB disk, and 28 idle tickets is
+# more per month in storage than the boxes cost to run. A preview is rebuilt from a branch
+# in minutes, so there is nothing on it worth keeping.
+#
+# The idle timer stops a box nobody is using after 15 minutes. This is the other half: once
+# the PR is closed or merged the box should not exist at all.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would be terminated and terminate nothing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  ORG: bluejay-ai-dev
+  AWS_REGION: us-east-1
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: app
+        with:
+          app-id: ${{ vars.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: bluejay-ai-dev
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terminate previews with no open PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          aws ec2 describe-instances \
+            --filters "Name=tag:bluejay:preview-ticket,Values=*" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`bluejay:preview-ticket`]|[0].Value]' \
+            --output text > boxes.tsv
+
+          [ -s boxes.tsv ] || { echo "no preview boxes"; exit 0; }
+
+          # One search for every open PR in the org, then match locally. A per-ticket query
+          # would be a request per box, and GitHub's search does no prefix matching anyway.
+          gh search prs --owner "$ORG" --state open --limit 200 --json title \
+            -q '.[].title' > titles.txt \
+            || { echo "::error::could not list open PRs; refusing to terminate blind"; exit 1; }
+
+          while read -r id ticket; do
+            [ -n "${id:-}" ] && [ -n "${ticket:-}" ] || continue
+            # Portable boundary, not \< \>: the runner's awk is mawk and has no word
+            # boundaries, which silently matched nothing the last time it was used here.
+            if grep -qiE "(^|[^A-Za-z0-9])${ticket}([^0-9]|$)" titles.txt; then
+              echo "keep    $ticket  $id  (still has an open PR)"
+              continue
+            fi
+            if [ "${DRY:-false}" = true ]; then
+              echo "would terminate  $ticket  $id"
+            else
+              echo "terminate  $ticket  $id"
+              aws ec2 terminate-instances --instance-ids "$id" >/dev/null
+            fi
+          done < boxes.tsv
