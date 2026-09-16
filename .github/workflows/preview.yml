@@ -1,23 +1,33 @@
 name: preview
 
-# Terminates preview boxes whose ticket has no open PR left.
+# One box per ticket, running the artifacts prod runs against the sandbox services, at a
+# public https url posted on the PR.
 #
-# Terminate, not stop. A stopped box still bills its 150 GB disk, and 28 idle tickets is
-# more per month in storage than the boxes cost to run. A preview is rebuilt from a branch
-# in minutes, so there is nothing on it worth keeping.
+# Called by each repo's caller on pull_request. The box builds itself and reports its own
+# url: the preview IAM role deliberately cannot open a security group, so nothing can ssh
+# in from CI, and nothing needs to.
 #
-# The idle timer stops a box nobody is using after 15 minutes. This is the other half: once
-# the PR is closed or merged the box should not exist at all.
+# `reap` is the other half of the cost model. The idle timer stops a box nobody is using
+# after 15 minutes; this deletes it once the ticket has no open PR. Terminate, not stop: a
+# stopped box still bills its 150 GB disk, which across idle tickets costs more than the
+# boxes do to run.
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'
+  workflow_call:
+    inputs:
+      ticket:
+        required: true
+        type: string
+    secrets:
+      RAILWAY_TOKEN:
+        required: true
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Report what would be terminated and terminate nothing'
-        type: boolean
-        default: true
+      ticket:
+        description: 'Ticket, e.g. ENG-123'
+        required: true
+  schedule:
+    - cron: '*/10 * * * *'
 
 permissions:
   contents: read
@@ -26,9 +36,122 @@ permissions:
 env:
   ORG: bluejay-ai-dev
   AWS_REGION: us-east-1
+  ROLE: arn:aws:iam::148660429236:role/bluejay-preview-ci
+  REPOS: bluejay_middleware bluejay_frontend_v2 livekit_agent text_agent evals livekit_dispatcher emails-lambda
 
 jobs:
+  launch:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: bluejay-ai-dev/bluejay-github-actions
+          ref: ${{ github.job_workflow_sha || github.sha }}
+
+      - uses: actions/create-github-app-token@v1
+        id: app
+        with:
+          app-id: ${{ vars.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: bluejay-ai-dev
+
+      - name: Which repos does this ticket touch
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TICKET: ${{ inputs.ticket }}
+        run: |
+          set -euo pipefail
+          case "$TICKET" in
+            [A-Z]*-[0-9]*) ;;
+            *) echo "::error::ticket must look like ENG-123, got '$TICKET'"; exit 1 ;;
+          esac
+
+          : > overrides.txt
+          : > prs.txt
+          for repo in $REPOS; do
+            # Server-side search, not a client-side limit: middleware alone has over a
+            # hundred open PRs and a --limit would silently miss the one we want.
+            hit=$(gh pr list -R "$ORG/$repo" --state open --search "$TICKET in:title" --limit 20 \
+                  --json number,title,headRefName \
+                  -q "first(.[] | select((.title | test(\"(^|[^A-Za-z0-9])$TICKET([^0-9]|\$)\";\"i\")) and (.headRefName | endswith(\"--np\") | not)) | \"\(.headRefName) \(.number)\") // \"\"") \
+              || { echo "::error::could not list PRs on $repo"; exit 1; }
+            branch=""; num=""
+            read -r branch num <<<"$hit"
+            [ -n "$branch" ] || continue
+            printf '%s %s\n' "$repo" "$branch" >> overrides.txt
+            printf '%s %s\n' "$repo" "$num"    >> prs.txt
+          done
+
+          [ -s prs.txt ] || { echo "::error::no open PR carries $TICKET"; exit 1; }
+          echo "changed:"; cat overrides.txt
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Replace any existing box for this ticket
+        env:
+          TICKET: ${{ inputs.ticket }}
+        run: |
+          set -euo pipefail
+          old=$(aws ec2 describe-instances \
+            --filters "Name=tag:bluejay:preview-ticket,Values=$TICKET" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+          [ -n "$old" ] && [ "$old" != None ] || exit 0
+          echo "replacing $old"
+          aws ec2 terminate-instances --instance-ids $old >/dev/null
+
+      - name: Launch
+        env:
+          TICKET: ${{ inputs.ticket }}
+          BOX_GH_TOKEN: ${{ steps.app.outputs.token }}
+          BOX_RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          set -euo pipefail
+          ami=$(aws ec2 describe-images --owners self \
+            --filters "Name=tag:bluejay:devbox-ami,Values=1" "Name=state,Values=available" \
+            --query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text)
+          [ -n "$ami" ] && [ "$ami" != None ] || { echo "::error::no baked AMI; run 'bj bake'"; exit 1; }
+          sg=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=bluejay-devbox" \
+                --query 'SecurityGroups[0].GroupId' --output text)
+
+          # Two tokens in user-data rather than ninety variables. IMDSv2 gates user-data
+          # behind a PUT-issued token, both expire, and the box is disposable.
+          {
+            echo '#!/bin/bash'
+            echo 'set -uo pipefail'
+            printf 'export TICKET=%q ORG=%q GH_TOKEN=%q RAILWAY_TOKEN=%q\n' \
+              "$TICKET" "$ORG" "$BOX_GH_TOKEN" "$BOX_RAILWAY_TOKEN"
+            printf 'export OVERRIDES=%q\n' "$(cat overrides.txt)"
+            printf 'export PRS=%q\n' "$(cat prs.txt)"
+            echo 'cat > /home/ubuntu/preview-boot.sh <<'"'"'BOOTEOF'"'"''
+            cat bin/preview-boot.sh
+            echo 'BOOTEOF'
+            echo 'chmod +x /home/ubuntu/preview-boot.sh; chown ubuntu:ubuntu /home/ubuntu/preview-boot.sh'
+            echo 'runuser -u ubuntu -- env TICKET="$TICKET" ORG="$ORG" GH_TOKEN="$GH_TOKEN" RAILWAY_TOKEN="$RAILWAY_TOKEN" OVERRIDES="$OVERRIDES" PRS="$PRS" bash /home/ubuntu/preview-boot.sh'
+          } > userdata.sh
+
+          id=$(aws ec2 run-instances \
+            --image-id "$ami" --instance-type m7i-flex.2xlarge --count 1 \
+            --security-group-ids "$sg" \
+            --iam-instance-profile Name=bluejay-devbox \
+            --metadata-options HttpTokens=required,HttpEndpoint=enabled \
+            --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=150,VolumeType=gp3,DeleteOnTermination=true,Encrypted=true}' \
+            --tag-specifications \
+              "ResourceType=instance,Tags=[{Key=Name,Value=bluejay-preview-$TICKET},{Key=bluejay:preview-ticket,Value=$TICKET}]" \
+              "ResourceType=volume,Tags=[{Key=bluejay:preview-ticket,Value=$TICKET}]" \
+            --user-data "file://userdata.sh" \
+            --query 'Instances[0].InstanceId' --output text)
+
+          echo "### preview for \`$TICKET\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Box \`$id\` is building. It comments the url on the PRs when it is up, and posts the boot log if it fails." >> "$GITHUB_STEP_SUMMARY"
+
   reap:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -41,40 +164,30 @@ jobs:
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
+          role-to-assume: ${{ env.ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Terminate previews with no open PR
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-          DRY: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
-
           aws ec2 describe-instances \
             --filters "Name=tag:bluejay:preview-ticket,Values=*" \
                       "Name=instance-state-name,Values=pending,running,stopping,stopped" \
             --query 'Reservations[].Instances[].[InstanceId,Tags[?Key==`bluejay:preview-ticket`]|[0].Value]' \
             --output text > boxes.tsv
-
           [ -s boxes.tsv ] || { echo "no preview boxes"; exit 0; }
 
-          # One search for every open PR in the org, then match locally. A per-ticket query
-          # would be a request per box, and GitHub's search does no prefix matching anyway.
-          gh search prs --owner "$ORG" --state open --limit 200 --json title \
-            -q '.[].title' > titles.txt \
+          gh search prs --owner "$ORG" --state open --limit 200 --json title -q '.[].title' > titles.txt \
             || { echo "::error::could not list open PRs; refusing to terminate blind"; exit 1; }
 
           while read -r id ticket; do
             [ -n "${id:-}" ] && [ -n "${ticket:-}" ] || continue
-            # Portable boundary, not \< \>: the runner's awk is mawk and has no word
-            # boundaries, which silently matched nothing the last time it was used here.
+            # Portable boundary, not \< \>: the runner's awk is mawk and has none, which
+            # silently matched nothing the last time that pattern was used here.
             if grep -qiE "(^|[^A-Za-z0-9])${ticket}([^0-9]|$)" titles.txt; then
-              echo "keep    $ticket  $id  (still has an open PR)"
-              continue
-            fi
-            if [ "${DRY:-false}" = true ]; then
-              echo "would terminate  $ticket  $id"
+              echo "keep       $ticket  $id"
             else
               echo "terminate  $ticket  $id"
               aws ec2 terminate-instances --instance-ids "$id" >/dev/null
