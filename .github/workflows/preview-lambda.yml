@@ -135,7 +135,7 @@ jobs:
         if: steps.names.outputs.skip != '1'
         env:
           GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           FN: ${{ steps.names.outputs.fn }}
           BASE: ${{ steps.names.outputs.base }}
           REPO: ${{ inputs.repo }}
@@ -147,12 +147,7 @@ jobs:
           ticket=$(grep -oiE '\b[A-Z]+-[0-9]+\b' <<<"$title" | head -1 | tr '[:lower:]' '[:upper:]')
           [ -n "$ticket" ] || { echo "no ticket in the title, nothing to wire"; exit 0; }
 
-          mw=$(gh pr list -R bluejay-ai-dev/bluejay_middleware --state open \
-                 --search "$ticket in:title" --limit 5 --json number \
-                 -q 'first(.[].number) // ""')
-          [ -n "$mw" ] || { echo "$ticket has no open middleware PR, so it has no preview to wire"; exit 0; }
-
-          env_name="bluejay_middleware-pr-$mw"
+          env_name="preview-$(tr '[:upper:]' '[:lower:]' <<<"$ticket")"
           # Which variable middleware reads depends on which lambda this is.
           case "$BASE" in
             evaluator)  key=LAMBDA_FUNCTION_NAME ;;
@@ -165,7 +160,13 @@ jobs:
           [ "$ACTION" = closed ] && value="sandbox_$BASE"
 
           npm i -g @railway/cli >/dev/null 2>&1
-          if railway variable set --service middleware --environment "$env_name" "$key=$value" >/dev/null 2>&1; then
+          # Same link-file trick as preview-ticket.yml: the CLI needs a linked project and
+          # `railway link` cannot authenticate a team token.
+          mkdir -p ~/.railway
+          jq -n --arg d "$PWD" --arg p 7047af18-477f-42e0-a905-f2e8f7ccac0f \
+            '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:"0a1b75a1-8402-418a-8192-00fe1613ec14",environmentName:"preview-base",service:null}}}' \
+            > ~/.railway/config.json
+          if railway variable set --service middleware --environment "$env_name" --skip-deploys "$key=$value" >/dev/null 2>&1; then
             echo "$env_name: $key=$value"
           else
             echo "::warning::could not set $key on $env_name; the preview will use the shared lambda"

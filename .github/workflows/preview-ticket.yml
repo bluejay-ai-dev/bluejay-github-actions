@@ -28,6 +28,7 @@ env:
   ORG: bluejay-ai-dev
   PROJECT: 7047af18-477f-42e0-a905-f2e8f7ccac0f
   BASE_ENV: preview-base
+  BASE_ENV_ID: 0a1b75a1-8402-418a-8192-00fe1613ec14
   LABEL: preview
   # Repos that are Railway services in preview-base. Others are lambdas, handled by
   # preview-lambda.yml, or have no preview surface at all.
@@ -68,19 +69,31 @@ jobs:
           done
           echo "want=$want" >> "$GITHUB_OUTPUT"
 
-      - name: Install the Railway CLI
+      - name: Install the Railway CLI and link the project
         if: steps.t.outputs.skip != '1'
-        run: npm i -g @railway/cli >/dev/null 2>&1
+        env:
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm i -g @railway/cli >/dev/null 2>&1
+          # `railway environment` takes no --project, it reads the linked one, and
+          # `railway link` needs a user the team token does not have. The link file is
+          # just ids, so write it.
+          mkdir -p ~/.railway
+          jq -n --arg d "$PWD" --arg p "$PROJECT" --arg e "$BASE_ENV_ID" --arg n "$BASE_ENV" \
+            '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:$e,environmentName:$n,service:null}}}' \
+            > ~/.railway/config.json
+          railway environment list >/dev/null
 
       - name: Tear the ticket's preview down
         if: steps.t.outputs.skip != '1' && steps.t.outputs.want == '0'
         env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           ENV_NAME: ${{ steps.t.outputs.env_name }}
         run: |
           set -uo pipefail
-          if railway environment list --project "$PROJECT" 2>/dev/null | grep -q "$ENV_NAME"; then
-            railway environment delete "$ENV_NAME" --project "$PROJECT" --yes >/dev/null 2>&1 \
+          if railway environment list 2>/dev/null | grep -q "$ENV_NAME"; then
+            railway environment delete "$ENV_NAME" --yes >/dev/null 2>&1 \
               && echo "deleted $ENV_NAME" || echo "::warning::could not delete $ENV_NAME"
           else
             echo "$ENV_NAME does not exist, nothing to tear down"
@@ -91,7 +104,7 @@ jobs:
         if: steps.t.outputs.skip != '1' && steps.t.outputs.want == '1'
         env:
           GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           TICKET: ${{ steps.t.outputs.ticket }}
           ENV_NAME: ${{ steps.t.outputs.env_name }}
         run: |
@@ -114,8 +127,8 @@ jobs:
 
           # Recreate rather than patch: one command sets every branch atomically, and a
           # preview is disposable so there is nothing worth preserving across a refresh.
-          railway environment delete "$ENV_NAME" --project "$PROJECT" --yes >/dev/null 2>&1 || true
-          railway environment new "$ENV_NAME" --project "$PROJECT" --duplicate "$BASE_ENV" "${args[@]}" \
+          railway environment delete "$ENV_NAME" --yes >/dev/null 2>&1 || true
+          railway environment new "$ENV_NAME" --duplicate "$BASE_ENV" "${args[@]}" \
             || { echo "::error::could not create $ENV_NAME"; exit 1; }
 
           # Lambdas are deployed per PR by preview-lambda.yml; point this environment at them.
@@ -128,8 +141,9 @@ jobs:
               && echo "$lr: pr${n}_$base" || echo "::warning::could not point $key at pr${n}_$base"
           done
 
-          url=$(railway domain --service frontend --environment "$ENV_NAME" --project "$PROJECT" 2>/dev/null \
-                | grep -oE 'https://[a-z0-9.-]+' | head -1)
+          url=$(railway domain list --service frontend --environment "$ENV_NAME" --json 2>/dev/null \
+                | jq -r 'first(.domains[].domain) // ""')
+          [ -z "$url" ] || url="https://$url"
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "touched=$touched" >> "$GITHUB_OUTPUT"
           echo "preview: $url"
