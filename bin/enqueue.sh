@@ -145,17 +145,38 @@ rollback() { # <"repo:sha" ...>
     local parents m=""
     parents=$(gh api "repos/$ORG/$repo/commits/$sha" --jq '.parents | length' 2>/dev/null || echo 1)
     [ "${parents:-1}" -gt 1 ] && m="-m 1"
-    # A fresh clone has no identity and the runner has no global one, so revert dies
-    # with "Committer identity unknown" before it ever reaches the push.
-    if git clone -q --depth 20 "https://x-access-token:${GH_TOKEN}@github.com/$ORG/$repo" "$d" 2>/dev/null \
-       && git -C "$d" -c user.email=releases@getbluejay.ai -c user.name="bluejay releases" \
-              revert --no-edit $m "$sha" >/dev/null 2>&1 \
-       && git -C "$d" push -q origin HEAD:main 2>/dev/null; then
+    # Identity is set rather than left to git's fallback, which derives it from the
+    # account and fails on a runner with no full name set.
+    # Errors are reported, never swallowed. The last rollback failed on all four repos
+    # and said only "COULD NOT REVERT", which told nobody anything.
+    local err=""
+    if ! err=$(git clone --depth 20 "https://x-access-token:${GH_TOKEN}@github.com/$ORG/$repo" "$d" 2>&1); then
+      warn "  clone failed: $(tail -2 <<<"$err")"
+    elif ! err=$(git -C "$d" -c user.email=releases@getbluejay.ai -c user.name="bluejay releases" \
+                 revert --no-edit $m "$sha" 2>&1); then
+      warn "  revert failed: $(tail -2 <<<"$err")"
+    elif err=$(git -C "$d" push origin HEAD:main 2>&1); then
       say "  reverted $repo $sha"
       ROLLBACK_OK="$ROLLBACK_OK $repo"
+      rm -rf "$d"; continue
+    else
+      warn "  push failed: $(tail -2 <<<"$err")"
+    fi
+
+    # Direct push to main is the one thing the merge App cannot do on a protected repo.
+    # Leaving main dirty with no handle is worse than a PR someone can click, so open one.
+    ROLLBACK_FAILED="$ROLLBACK_FAILED $repo"
+    local tk=${TICKET:-batch}; local url=""
+    local br="revert-$tk-${sha:0:7}"
+    if git -C "$d" rev-parse HEAD >/dev/null 2>&1 \
+       && git -C "$d" push -q origin "HEAD:$br" 2>/dev/null \
+       && url=$(gh pr create -R "$ORG/$repo" --base main --head "$br" \
+                  --title "Revert $tk on $repo" \
+                  --body "Automatic rollback could not push to main. $sha landed as part of $tk and the batch was kicked back." \
+                  2>/dev/null); then
+      warn "  opened a revert PR instead: $url"
     else
       warn "  COULD NOT REVERT $repo $sha, main still carries it"
-      ROLLBACK_FAILED="$ROLLBACK_FAILED $repo"
     fi
     rm -rf "$d"
   done
