@@ -20,7 +20,11 @@
   "homepage": "https://github.com/bluejay-ai-dev/bluejay-github-actions#readme",
   "description": "",
   "dependencies": {
-    "@actions/core": "^1.11.1"
+    "@actions/core": "^3.0.1"
+  },
+  "overrides": {
+    "undici": "6.28.0",
+    "@actions/http-client": "^3.0.0"
   },
   "devDependencies": {
     "typescript": "^5.9.3"
