@@ -123,6 +123,49 @@ jobs:
           aws lambda wait function-active-v2 --function-name "$FN"
           echo "deployed $FN from $uri"
 
+      # An evals PR creates no Railway environment of its own: evals is not a Railway
+      # service. The preview that should use this lambda is the one belonging to the
+      # ticket's middleware PR, so find it by ticket and override the one variable.
+      - name: Point the ticket's preview at this lambda
+        if: steps.names.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          FN: ${{ steps.names.outputs.fn }}
+          BASE: ${{ steps.names.outputs.base }}
+          REPO: ${{ inputs.repo }}
+          PR: ${{ inputs.pr }}
+          ACTION: ${{ inputs.action }}
+        run: |
+          set -uo pipefail
+          title=$(gh pr view "$PR" -R "bluejay-ai-dev/$REPO" --json title -q .title 2>/dev/null || true)
+          ticket=$(grep -oiE '\b[A-Z]+-[0-9]+\b' <<<"$title" | head -1 | tr '[:lower:]' '[:upper:]')
+          [ -n "$ticket" ] || { echo "no ticket in the title, nothing to wire"; exit 0; }
+
+          mw=$(gh pr list -R bluejay-ai-dev/bluejay_middleware --state open \
+                 --search "$ticket in:title" --limit 5 --json number \
+                 -q 'first(.[].number) // ""')
+          [ -n "$mw" ] || { echo "$ticket has no open middleware PR, so it has no preview to wire"; exit 0; }
+
+          env_name="bluejay_middleware-pr-$mw"
+          # Which variable middleware reads depends on which lambda this is.
+          case "$BASE" in
+            evaluator)  key=LAMBDA_FUNCTION_NAME ;;
+            text_agent) key=TEXT_AGENT_LAMBDA_FUNCTION_NAME ;;
+            *) echo "no middleware variable maps to $BASE"; exit 0 ;;
+          esac
+
+          # On close, hand it back to the shared sandbox copy rather than a deleted function.
+          value="$FN"
+          [ "$ACTION" = closed ] && value="sandbox_$BASE"
+
+          npm i -g @railway/cli >/dev/null 2>&1
+          if railway variable set --service middleware --environment "$env_name" "$key=$value" >/dev/null 2>&1; then
+            echo "$env_name: $key=$value"
+          else
+            echo "::warning::could not set $key on $env_name; the preview will use the shared lambda"
+          fi
+
       - name: Output
         id: out
         env:
