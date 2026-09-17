@@ -60,17 +60,23 @@ jobs:
           # must not pull the environment out from under the rest.
           # Wanting one means targeting main, which is every release-bound PR, or carrying
           # the label, which is how a PR to another base opts in.
+          # --np opts a single PR out. It does not veto the ticket: a docs-only PR beside a
+          # real one should not cost the rest of the ticket its environment.
           want=0
           for entry in $RAILWAY_REPOS; do
             r=${entry%%:*}
-            while read -r n base labels; do
+            # no field may be empty: tab is IFS whitespace, so a blank one collapses
+            # and shifts the title into labels, hiding a --np in the title.
+            while IFS=$'\t' read -r n base head labels title; do
               [ -n "${n:-}" ] || continue
+              case "$head$title" in *--np*) echo "$r#$n is --np, not counting it"; continue ;; esac
               if [ "$base" = main ] || grep -q "$LABEL" <<<"$labels"; then
                 want=1
               fi
             done < <(gh pr list -R "$ORG/$r" --state open --search "$ticket in:title" --limit 10 \
-                     --json number,baseRefName,labels \
-                     -q '.[] | "\(.number) \(.baseRefName) \([.labels[].name]|join(","))"')
+                     --json number,baseRefName,headRefName,labels,title \
+                     -q '.[] | [(.number|tostring), .baseRefName, .headRefName,
+                                (([.labels[].name]|join(",")) | if . == "" then "-" else . end), .title] | @tsv')
           done
           echo "want=$want" >> "$GITHUB_OUTPUT"
 
@@ -123,7 +129,7 @@ jobs:
             r=${entry%%:*}; svc=${entry##*:}
             br=$(gh pr list -R "$ORG/$r" --state open --search "$TICKET in:title" --limit 10 \
                  --json number,title,headRefName \
-                 -q "first(.[] | select(.title | test(\"(^|[^A-Za-z0-9])$TICKET([^0-9]|\$)\";\"i\")) | .headRefName) // \"\"")
+                 -q "first(.[] | select((.title | test(\"(^|[^A-Za-z0-9])$TICKET([^0-9]|\$)\";\"i\")) and ((.headRefName + .title) | contains(\"--np\") | not)) | .headRefName) // \"\"")
             [ -n "$br" ] || { echo "$r: main (untouched)"; continue; }
             echo "$r: $br"
             args+=(--service-config "$svc" source.branch "$br")
