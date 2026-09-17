@@ -137,7 +137,10 @@ jobs:
           # The sandbox functions are arm64, so the image has to be too or the function
           # fails at first invoke rather than at deploy.
           docker buildx create --use --name preview >/dev/null 2>&1 || docker buildx use preview
-          docker buildx build --platform linux/arm64 -t "$uri" --push . \
+          # Lambda cannot read the OCI index buildx emits with attestations attached, so
+          # the image has to be built without them or CreateFunction rejects it.
+          docker buildx build --platform linux/arm64 --provenance=false --sbom=false \
+            -t "$uri" --push . \
             || { echo "::error::image build failed"; exit 1; }
 
           # Clone the sandbox function's shape so the preview behaves like sandbox: same
