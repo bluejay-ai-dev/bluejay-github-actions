@@ -160,8 +160,16 @@ jobs:
               && echo "$lr: pr${n}_$base" || echo "::warning::could not point $key at pr${n}_$base"
           done
 
-          url=$(railway domain list --service frontend --environment "$ENV_NAME" --json 2>/dev/null \
-                | jq -r 'first(.domains[].domain) // ""')
+          # a duplicated environment gets its domain a beat after it exists, and reading
+          # in that gap returns nothing, which silently costs the PR its comment.
+          url=""
+          for _ in $(seq 1 30); do
+            url=$(railway domain list --service frontend --environment "$ENV_NAME" --json 2>/dev/null \
+                  | jq -r 'first(.domains[].domain) // ""')
+            [ -n "$url" ] && break
+            sleep 2
+          done
+          [ -n "$url" ] || echo "::warning::no frontend domain on $ENV_NAME after 60s"
           [ -z "$url" ] || url="https://$url"
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "touched=$touched" >> "$GITHUB_OUTPUT"
