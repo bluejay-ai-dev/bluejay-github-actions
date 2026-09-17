@@ -144,13 +144,15 @@ jobs:
           # before it is actually free, so polling the list is not a usable signal. Retry
           # the create instead: losing this race leaves the ticket with NO environment,
           # because the delete already succeeded.
+          # Two transient failures land here: the name not yet free, and the workspace cap
+          # of one environment per 30 seconds. Retry on anything, since by this point the
+          # delete has already happened and giving up leaves the ticket with nothing.
           created=0 err=""
-          for _ in $(seq 1 30); do
+          for _ in $(seq 1 20); do
             if err=$(railway environment new "$ENV_NAME" --duplicate "$BASE_ENV" "${args[@]}" 2>&1); then
               created=1; break
             fi
-            grep -qi "already exists" <<<"$err" || break
-            sleep 3
+            sleep 6
           done
           [ "$created" = 1 ] \
             || { echo "::error::could not create $ENV_NAME: $(tail -2 <<<"$err")"; exit 1; }
