@@ -70,7 +70,7 @@ pr_state() { # <repo> <num> -> "mergeable review failing"
     -q '[(.mergeable // "UNKNOWN"),
          ((.reviewDecision // "") | if . == "" then "NONE" else . end),
          ([.statusCheckRollup[]? | (.conclusion // .state // "PENDING") | ascii_upcase
-           | select(IN("SUCCESS","NEUTRAL","SKIPPED") | not)] | length | tostring)]
+           | select(IN("SUCCESS","NEUTRAL","SKIPPED","CANCELLED") | not)] | length | tostring)]
         | @tsv'
 }
 
