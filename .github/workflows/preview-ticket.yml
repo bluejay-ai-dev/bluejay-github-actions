@@ -160,7 +160,7 @@ jobs:
           # Lambdas are deployed per PR by preview-lambda.yml; point this environment at them.
           for pair in evals:LAMBDA_FUNCTION_NAME:evaluator text_agent:TEXT_AGENT_LAMBDA_FUNCTION_NAME:text_agent; do
             lr=${pair%%:*}; rest=${pair#*:}; key=${rest%%:*}; base=${rest##*:}
-            n=$(gh pr list -R "$ORG/$lr" --state open --search "$TICKET in:title" --limit 5 --json number -q 'first(.[].number) // ""')
+            n=$(gh pr list -R "$ORG/$lr" --state open --search "$TICKET in:title" --limit 5 --json number -q 'first(.[].number) // ""') || n=""
             [ -n "$n" ] || continue
             railway variable set --service middleware --environment "$ENV_NAME" --project "$PROJECT" \
               --skip-deploys "$key=pr${n}_$base" >/dev/null 2>&1 \
@@ -171,13 +171,28 @@ jobs:
           # in that gap returns nothing, which silently costs the PR its comment.
           url=""
           for _ in $(seq 1 30); do
+            # `|| url=""`, not a bare assignment: under -e plus pipefail a failing
+            # `domain list` kills the step outright, which is what the retry is for.
             url=$(railway domain list --service frontend --environment "$ENV_NAME" --json 2>/dev/null \
-                  | jq -r 'first(.domains[].domain) // ""')
+                  | jq -r 'first(.domains[].domain) // ""') || url=""
             [ -n "$url" ] && break
             sleep 2
           done
           [ -n "$url" ] || echo "::warning::no frontend domain on $ENV_NAME after 60s"
           [ -z "$url" ] || url="https://$url"
+          # Railway serves "the train has not arrived at the station" until the service
+          # deploys, and Next takes minutes. A link posted before then looks broken, so
+          # wait for it, and say so in the comment when it is still going.
+          ready=0
+          if [ -n "$url" ]; then
+            for _ in $(seq 1 60); do
+              code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || echo 000)
+              case "$code" in 200|3??|401|403) ready=1; break ;; esac
+              sleep 10
+            done
+            [ "$ready" = 1 ] && echo "frontend serving ($code)" || echo "::warning::frontend still building after 10 min"
+          fi
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "touched=$touched" >> "$GITHUB_OUTPUT"
           echo "preview: $url"
@@ -190,12 +205,14 @@ jobs:
           TICKET: ${{ steps.t.outputs.ticket }}
           URL: ${{ steps.up.outputs.url }}
           TOUCHED: ${{ steps.up.outputs.touched }}
+          READY: ${{ steps.up.outputs.ready }}
         run: |
           set -uo pipefail
           body=":rocket: **Preview for $TICKET** · $URL"
+          [ "$READY" = 1 ] || body="$body"$'\n\n'":hourglass: Still building, give it a few minutes."
           body="$body"$'\n\n'"Every PR on this ticket is in it. Repos the ticket does not touch run \`main\`."
           body="$body"$'\n'"Changed here:$TOUCHED. Data is the shared sandbox, not production."
-          body="$body"$'\n'"It is rebuilt on every push and deleted when the last labelled PR closes."
+          body="$body"$'\n'"It is rebuilt on every push and torn down when the ticket's last PR closes."
 
           # One comment per PR, replacing our own previous one so pushes do not pile up.
           for entry in $RAILWAY_REPOS evals:x text_agent:x livekit_dispatcher:x; do
