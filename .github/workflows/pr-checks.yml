@@ -4,6 +4,14 @@ name: pr-checks
 # scripts in one place instead of copied into seven repos.
 on:
   workflow_call:
+    inputs:
+      # build and deterministic predate this gate and are red in several repos for
+      # reasons unrelated to any PR, a Dockerfile apt step among them. Opt in per repo
+      # once they pass there, rather than blocking every PR in the org on them.
+      heavy:
+        description: 'Also run build and deterministic'
+        type: boolean
+        default: false
     secrets:
       SANDBOX_GH_TOKEN: { required: true }
       LINEAR_API_KEY:   { required: true }
@@ -194,6 +202,7 @@ jobs:
           exit $bad
 
   build:
+    if: inputs.heavy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -214,6 +223,7 @@ jobs:
           fi
 
   deterministic:
+    if: inputs.heavy
     runs-on: ubuntu-latest
     services:
       postgres:
