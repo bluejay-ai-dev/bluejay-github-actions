@@ -5,11 +5,11 @@ name: pr-checks
 on:
   workflow_call:
     inputs:
-      # build and deterministic predate this gate and are red in several repos for
-      # reasons unrelated to any PR, a Dockerfile apt step among them. Opt in per repo
-      # once they pass there, rather than blocking every PR in the org on them.
+      # build is red in several repos for reasons no PR introduced, a Dockerfile apt
+      # step among them. Opt in per repo once it passes there, rather than blocking
+      # every PR in the org on it.
       heavy:
-        description: 'Also run build and deterministic'
+        description: 'Also run the docker/npm build'
         type: boolean
         default: false
     secrets:
@@ -162,7 +162,9 @@ jobs:
           BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
-          b="${BODY:-}"
+          # cubic appends its own block with an <img> review button. Counting that as
+          # the author's screenshot passed this check on every cubic-reviewed PR.
+          b=$(python3 -c 'import os,re; print(re.sub(r"<!-- This is an auto-generated description by cubic\. -->.*?<!-- End of auto-generated description by cubic\. -->","",os.environ.get("BODY",""),flags=re.S))')
           # markdown image, html img/video, or a github attachment link
           if grep -qiE '!\[[^]]*\]\([^)]+\)|<img |<video |user-attachments/assets/|githubusercontent\.com' <<<"$b"; then
             echo "visuals: found" >> "$GITHUB_STEP_SUMMARY"
@@ -231,7 +233,6 @@ jobs:
           fi
 
   deterministic:
-    if: inputs.heavy
     runs-on: ubuntu-latest
     services:
       postgres:

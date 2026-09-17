@@ -162,7 +162,14 @@ c_rls() {
 
 c_codegen() {
   local ran=0
-  if [ -f prisma/schema.prisma ]; then npx --yes prisma generate >/dev/null; ran=1; fi
+  if [ -f prisma/schema.prisma ]; then
+    # From a temp cwd with an absolute --schema: npx inside a repo that has a
+    # package.json but no node_modules dies on "Cannot read properties of null
+    # (reading 'edgesOut')" while resolving a tree it does not need.
+    ( cd "$(mktemp -d)" && npx --yes prisma generate --schema "$OLDPWD/prisma/schema.prisma" >/dev/null ) \
+      || die "prisma generate failed"
+    ran=1
+  fi
   if [ -f package.json ] && jq -e '.scripts.codegen' package.json >/dev/null 2>&1; then npm run codegen >/dev/null; ran=1; fi
   [ "$ran" = 1 ] || skip "no prisma schema and no codegen script"
   git diff --exit-code || die "codegen produced a diff, commit it"
