@@ -190,6 +190,13 @@ jobs:
           jq -e '.data.issue' >/dev/null <<<"$resp" || { echo "::error::$ID does not exist in Linear"; exit 1; }
 
           bad=0
+          # "How we ship v2-2": the ticket must exist and not be Done or Canceled. A PR
+          # against a closed ticket means the ticket is wrong or the PR is.
+          state=$(jq -r '.data.issue.state.name' <<<"$resp")
+          case "$state" in
+            Done|Canceled|Duplicate)
+              echo "::error::$ID is $state. Reopen it or point the PR at the right ticket."; bad=1 ;;
+          esac
           desc=$(jq -r '.data.issue.description // ""' <<<"$resp" | tr -d '[:space:]' | wc -c | tr -d ' ')
           [ "$desc" -ge 20 ] || { echo "::error::$ID has no description. Say what the issue is and what to do."; bad=1; }
           jq -e '.data.issue.assignee' >/dev/null <<<"$resp" \
