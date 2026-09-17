@@ -29,7 +29,6 @@ env:
   PROJECT: 7047af18-477f-42e0-a905-f2e8f7ccac0f
   BASE_ENV: preview-base
   BASE_ENV_ID: 0a1b75a1-8402-418a-8192-00fe1613ec14
-  LABEL: preview
   # Repos that are Railway services in preview-base. Others are lambdas, handled by
   # preview-lambda.yml, or have no preview surface at all.
   RAILWAY_REPOS: bluejay_middleware:middleware bluejay_frontend_v2:frontend
@@ -58,25 +57,20 @@ jobs:
 
           # A ticket keeps its preview while ANY of its PRs still wants one. One PR closing
           # must not pull the environment out from under the rest.
-          # Wanting one means targeting main, which is every release-bound PR, or carrying
-          # the label, which is how a PR to another base opts in.
+          # Wanting one means targeting main. A preview mirrors prod, so it only makes
+          # sense for a PR that is actually headed there; dev PRs get nothing.
           # --np opts a single PR out. It does not veto the ticket: a docs-only PR beside a
           # real one should not cost the rest of the ticket its environment.
           want=0
           for entry in $RAILWAY_REPOS; do
             r=${entry%%:*}
-            # no field may be empty: tab is IFS whitespace, so a blank one collapses
-            # and shifts the title into labels, hiding a --np in the title.
-            while IFS=$'\t' read -r n base head labels title; do
+            while IFS=$'\t' read -r n base head title; do
               [ -n "${n:-}" ] || continue
               case "$head$title" in *--np*) echo "$r#$n is --np, not counting it"; continue ;; esac
-              if [ "$base" = main ] || grep -q "$LABEL" <<<"$labels"; then
-                want=1
-              fi
+              [ "$base" = main ] && want=1
             done < <(gh pr list -R "$ORG/$r" --state open --search "$ticket in:title" --limit 10 \
-                     --json number,baseRefName,headRefName,labels,title \
-                     -q '.[] | [(.number|tostring), .baseRefName, .headRefName,
-                                (([.labels[].name]|join(",")) | if . == "" then "-" else . end), .title] | @tsv')
+                     --json number,baseRefName,headRefName,title \
+                     -q '.[] | [(.number|tostring), .baseRefName, .headRefName, .title] | @tsv')
           done
           echo "want=$want" >> "$GITHUB_OUTPUT"
 

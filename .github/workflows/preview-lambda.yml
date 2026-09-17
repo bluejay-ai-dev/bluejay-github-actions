@@ -37,8 +37,8 @@ jobs:
     outputs:
       function: ${{ steps.out.outputs.function }}
     steps:
-      # Same `preview` label as preview-ticket.yml. Without this a lambda repo would
-      # build and push an image on every PR, which is the half that costs money.
+      # Same gate as preview-ticket.yml: PRs to main only. Without it a lambda repo
+      # would build and push an image on every PR, which is the half that costs money.
       - name: Does this PR want a preview
         id: gate
         env:
@@ -48,9 +48,9 @@ jobs:
           ACTION: ${{ inputs.action }}
         run: |
           set -euo pipefail
-          IFS=$'\t' read -r base has np < <(gh pr view "$PR" -R "bluejay-ai-dev/$REPO" \
-                --json baseRefName,headRefName,labels,title \
-                -q '[.baseRefName, ([.labels[].name] | index("preview") // "no"),
+          IFS=$'\t' read -r base np < <(gh pr view "$PR" -R "bluejay-ai-dev/$REPO" \
+                --json baseRefName,headRefName,title \
+                -q '[.baseRefName,
                      (if ((.headRefName + .title) | contains("--np")) then "np" else "-" end)] | @tsv')
           # closed always runs, so a teardown still removes the function whatever the base,
           # including a PR marked --np after its function was already built.
@@ -62,7 +62,7 @@ jobs:
           elif [ "$base" = main ] || [ "$has" != no ]; then
             echo "go=1" >> "$GITHUB_OUTPUT"
           else
-            echo "not a PR to main and no preview label, nothing to build"
+            echo "not a PR to main, nothing to build"
             echo "go=0" >> "$GITHUB_OUTPUT"
           fi
 
