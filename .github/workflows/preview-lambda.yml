@@ -110,6 +110,10 @@ jobs:
         env:
           FN: ${{ steps.names.outputs.fn }}
           ECR: ${{ steps.names.outputs.ecr }}
+          # AWS_REGION beats AWS_DEFAULT_REGION, and configure-aws-credentials set it to
+          # us-west-1 before `names` had resolved, so an ECR token was minted in the
+          # wrong region and the us-east-1 registry rejected the login with a 400.
+          AWS_REGION: ${{ steps.names.outputs.region }}
           AWS_DEFAULT_REGION: ${{ steps.names.outputs.region }}
           PR: ${{ inputs.pr }}
         run: |
@@ -124,6 +128,10 @@ jobs:
           FN: ${{ steps.names.outputs.fn }}
           ECR: ${{ steps.names.outputs.ecr }}
           REGION: ${{ steps.names.outputs.region }}
+          # AWS_REGION beats AWS_DEFAULT_REGION, and configure-aws-credentials set it to
+          # us-west-1 before `names` had resolved, so an ECR token was minted in the
+          # wrong region and the us-east-1 registry rejected the login with a 400.
+          AWS_REGION: ${{ steps.names.outputs.region }}
           AWS_DEFAULT_REGION: ${{ steps.names.outputs.region }}
           PR: ${{ inputs.pr }}
         run: |
