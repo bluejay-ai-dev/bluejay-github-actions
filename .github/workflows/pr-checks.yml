@@ -4,6 +4,11 @@ name: pr-checks
 # scripts in one place instead of copied into seven repos.
 on:
   workflow_call:
+    secrets:
+      SANDBOX_GH_TOKEN: { required: true }
+      LINEAR_API_KEY:   { required: true }
+      RAILWAY_TOKEN:    { required: false }
+      INFISICAL_TOKEN:  { required: false }
 
 permissions:
   contents: read
@@ -118,6 +123,75 @@ jobs:
           [ "$found" = 1 ] || echo "$ID touches this repo only" >> "$GITHUB_STEP_SUMMARY"
           [ "$fail" = 0 ] || echo "::error::a sibling PR on $ID is red"
           exit $fail
+
+  # Hygiene. These read the PR and its ticket, nothing else, so they finish in seconds
+  # and fail with the specific thing to fix rather than "checks failed".
+  description:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # python, not sed: stripping html comments needs a lazy quantifier, which POSIX
+          # ERE does not have, and the sed version measured every body as empty.
+          chars=$(python3 -c 'import os,re; b=re.sub(r"<!--.*?-->","",os.environ.get("BODY",""),flags=re.S); print(len(re.sub(r"\s","",b)))')
+          if [ "$chars" -lt 30 ]; then
+            echo "::error::PR description is empty or boilerplate ($chars real characters)."
+            echo "::error::Say what changed and why, in a couple of terse lines. Not the incident, not a test plan."
+            exit 1
+          fi
+          echo "description: $chars characters" >> "$GITHUB_STEP_SUMMARY"
+
+  visuals:
+    runs-on: ubuntu-latest
+    # `no-visual` is the release valve for a change with genuinely nothing to look at,
+    # a migration or a CI tweak. It is a label so the reason is visible on the PR.
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-visual') }}
+    steps:
+      - env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          b="${BODY:-}"
+          # markdown image, html img/video, or a github attachment link
+          if grep -qiE '!\[[^]]*\]\([^)]+\)|<img |<video |user-attachments/assets/|githubusercontent\.com' <<<"$b"; then
+            echo "visuals: found" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "::error::No screenshot or video in the PR description."
+          echo "::error::Drag an image or screen recording into the body. Nothing to show? Add the 'no-visual' label."
+          exit 1
+
+  ticket-hygiene:
+    needs: ticket
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+          ID: ${{ needs.ticket.outputs.id }}
+        run: |
+          set -euo pipefail
+          # Fail closed. An unset key used to make this pass while checking nothing.
+          [ -n "${LINEAR_API_KEY:-}" ] || { echo "::error::LINEAR_API_KEY is not set, so the ticket cannot be checked"; exit 1; }
+          q='query($i:String!){issue(id:$i){identifier title description assignee{name} state{name}}}'
+          resp=$(curl -fsS --max-time 20 https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" -H 'content-type: application/json' \
+            -d "$(jq -nc --arg q "$q" --arg i "$ID" '{query:$q,variables:{i:$i}}')") \
+            || { echo "::error::could not reach Linear"; exit 1; }
+          jq -e '.data.issue' >/dev/null <<<"$resp" || { echo "::error::$ID does not exist in Linear"; exit 1; }
+
+          bad=0
+          desc=$(jq -r '.data.issue.description // ""' <<<"$resp" | tr -d '[:space:]' | wc -c | tr -d ' ')
+          [ "$desc" -ge 20 ] || { echo "::error::$ID has no description. Say what the issue is and what to do."; bad=1; }
+          jq -e '.data.issue.assignee' >/dev/null <<<"$resp" \
+            || { echo "::error::$ID is unassigned."; bad=1; }
+          {
+            echo "ticket: $ID"
+            echo "state: $(jq -r '.data.issue.state.name' <<<"$resp")"
+            echo "assignee: $(jq -r '.data.issue.assignee.name // "none"' <<<"$resp")"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $bad
 
   build:
     runs-on: ubuntu-latest
