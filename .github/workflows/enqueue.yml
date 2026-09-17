@@ -1,4 +1,4 @@
-name: enqueue
+name: Deploy to main
 
 # Merge every PR on a ticket, in the order .release/order.yml declares, or none of them.
 # Manual only: nothing merges because someone pushed.
