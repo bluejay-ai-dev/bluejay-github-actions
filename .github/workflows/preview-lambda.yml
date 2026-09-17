@@ -48,13 +48,13 @@ jobs:
           ACTION: ${{ inputs.action }}
         run: |
           set -euo pipefail
-          has=$(gh pr view "$PR" -R "bluejay-ai-dev/$REPO" --json labels \
-                -q '[.labels[].name] | index("preview") // "no"')
-          # closed always runs, so an unlabelled teardown still removes the function.
-          if [ "$ACTION" = closed ] || [ "$has" != no ]; then
+          read -r base has < <(gh pr view "$PR" -R "bluejay-ai-dev/$REPO" --json baseRefName,labels \
+                -q '"\(.baseRefName) \([.labels[].name] | index("preview") // "no")"')
+          # closed always runs, so a teardown still removes the function whatever the base.
+          if [ "$ACTION" = closed ] || [ "$base" = main ] || [ "$has" != no ]; then
             echo "go=1" >> "$GITHUB_OUTPUT"
           else
-            echo "no preview label, nothing to build"
+            echo "not a PR to main and no preview label, nothing to build"
             echo "go=0" >> "$GITHUB_OUTPUT"
           fi
 

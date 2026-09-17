@@ -56,16 +56,21 @@ jobs:
           echo "ticket=$ticket" >> "$GITHUB_OUTPUT"
           echo "env_name=preview-$(tr '[:upper:]' '[:lower:]' <<<"$ticket")" >> "$GITHUB_OUTPUT"
 
-          # A ticket keeps its preview while ANY of its PRs still carries the label. One PR
-          # closing or losing the label must not pull the environment out from under the rest.
+          # A ticket keeps its preview while ANY of its PRs still wants one. One PR closing
+          # must not pull the environment out from under the rest.
+          # Wanting one means targeting main, which is every release-bound PR, or carrying
+          # the label, which is how a PR to another base opts in.
           want=0
           for entry in $RAILWAY_REPOS; do
             r=${entry%%:*}
-            for n in $(gh pr list -R "$ORG/$r" --state open --search "$ticket in:title" --limit 10 --json number -q '.[].number'); do
-              if gh pr view "$n" -R "$ORG/$r" --json labels -q '[.labels[].name]|join(",")' | grep -q "$LABEL"; then
+            while read -r n base labels; do
+              [ -n "${n:-}" ] || continue
+              if [ "$base" = main ] || grep -q "$LABEL" <<<"$labels"; then
                 want=1
               fi
-            done
+            done < <(gh pr list -R "$ORG/$r" --state open --search "$ticket in:title" --limit 10 \
+                     --json number,baseRefName,labels \
+                     -q '.[] | "\(.number) \(.baseRefName) \([.labels[].name]|join(","))"')
           done
           echo "want=$want" >> "$GITHUB_OUTPUT"
 
