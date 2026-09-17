@@ -191,7 +191,8 @@ jobs:
           # `railway link` cannot authenticate a team token.
           mkdir -p ~/.railway
           jq -n --arg d "$PWD" --arg p 7047af18-477f-42e0-a905-f2e8f7ccac0f \
-            '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:"0a1b75a1-8402-418a-8192-00fe1613ec14",environmentName:"preview-base",service:null}}}' \
+            '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:"0a1b75a1-8402-418a-8192-00fe1613ec14",environmentName:"preview-base",service:null}},
+              user:{id:"",token:null,accessToken:null,refreshToken:null,tokenExpiresAt:0}}' \
             > ~/.railway/config.json
           if railway variable set --service middleware --environment "$env_name" --skip-deploys "$key=$value" >/dev/null 2>&1; then
             echo "$env_name: $key=$value"

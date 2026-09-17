@@ -86,7 +86,8 @@ jobs:
           # just ids, so write it.
           mkdir -p ~/.railway
           jq -n --arg d "$PWD" --arg p "$PROJECT" --arg e "$BASE_ENV_ID" --arg n "$BASE_ENV" \
-            '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:$e,environmentName:$n,service:null}}}' \
+            '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:$e,environmentName:$n,service:null}},
+              user:{id:"",token:null,accessToken:null,refreshToken:null,tokenExpiresAt:0}}' \
             > ~/.railway/config.json
           railway environment list >/dev/null
 
