@@ -140,6 +140,13 @@ jobs:
           # Recreate rather than patch: one command sets every branch atomically, and a
           # preview is disposable so there is nothing worth preserving across a refresh.
           railway environment delete "$ENV_NAME" --yes >/dev/null 2>&1 || true
+          # delete returns before the environment is gone, and creating into the gap fails
+          # with "an environment with that name already exists".
+          for _ in $(seq 1 30); do
+            railway environment list --json 2>/dev/null \
+              | jq -e --arg n "$ENV_NAME" 'any(.environments[]?; .name == $n)' >/dev/null || break
+            sleep 2
+          done
           railway environment new "$ENV_NAME" --duplicate "$BASE_ENV" "${args[@]}" \
             || { echo "::error::could not create $ENV_NAME"; exit 1; }
 
