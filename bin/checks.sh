@@ -29,14 +29,14 @@ need_base() { git rev-parse --verify -q "$REF" >/dev/null || die "$REF is not fe
 c_ticket_sane() {
   local n id st
   n=$(grep -oiE '\bENG-[0-9]+\b' <<<"${TITLE:-}" | sort -u | wc -l | tr -d ' ')
-  [ "$n" = 1 ] || die "title carries $n ticket ids, want exactly 1: ${TITLE:-<empty title>}"
+  [ "$n" = 1 ] || die "the title needs exactly one ENG-### and has $n. One ticket per PR is what groups it with its siblings. Title: ${TITLE:-<empty>}"
   id=$(ticket_id)
   echo "ok: title carries $id"
   [ -n "${LINEAR_API_KEY:-}" ] || die "LINEAR_API_KEY not set, cannot confirm $id is a real ticket"
   st=$(linear "$id" 'state{name}' | jq -r '.data.issue.state.name // "MISSING"')
   case "$st" in
-    MISSING)       die "$id does not exist in Linear" ;;
-    Done|Canceled) die "$id is $st" ;;
+    MISSING)       die "$id is in the PR title but no such ticket exists in Linear. Typo in the title, or the ticket was deleted." ;;
+    Done|Canceled) die "$id is $st in Linear. A PR should point at an open ticket: reopen it, or put the right id in the title." ;;
   esac
   echo "ok: $id is $st"
 }
@@ -58,7 +58,7 @@ c_video() {
   if grep -qE "$VIDEO" <<<"${BODY:-}"; then echo "ok: video in the PR body"; return 0; fi
   [ -n "${LINEAR_API_KEY:-}" ] || die "no video in the PR body and LINEAR_API_KEY not set, cannot read $id"
   d=$(linear "$id" description | jq -r '.data.issue.description // ""')
-  grep -qE "$VIDEO" <<<"$d" || die "frontend change with ${ADDITIONS} additions needs a video on $id or in the PR body"
+  grep -qE "$VIDEO" <<<"$d" || die "this touches the frontend and adds ${ADDITIONS} lines, so it needs a recording. Put one on $id in Linear or drag it into the PR body. Small or backend-only changes are exempt."
   echo "ok: video on $id"
 }
 
@@ -68,7 +68,7 @@ c_migrations_immutable() {
   need_base
   local m
   m=$(git diff --name-only --diff-filter=M "$REF...HEAD" -- "$MIG/*.sql" || true)
-  [ -z "$m" ] || die "already applied on $BASE and edited, dbmate will never re-run it: $m"
+  [ -z "$m" ] || die "these migrations are already applied on $BASE and were edited: $m\n      dbmate records the version as done and will never re-run them, so the edit reaches no database. Add a new migration instead."
   echo "ok: no migration on $BASE was edited"
 }
 
@@ -79,7 +79,7 @@ c_migrations_newest() {
   [ -n "$new" ] || skip "no new migrations"
   top=$(git ls-tree --name-only "$REF" "$MIG/" 2>/dev/null | versions | tail -1)
   [ -n "$top" ] || skip "$BASE has no migrations, nothing to be newer than"
-  [ "$new" -gt "$top" ] || die "version $new is not above $top on $BASE"
+  [ "$new" -gt "$top" ] || die "migration version $new is older than $top, which is already on $BASE. dbmate applies in version order and skips anything below the high-water mark, so this would never run. Rename it with a newer timestamp."
   echo "ok: oldest new version $new is above $top on $BASE"
 }
 
@@ -87,7 +87,7 @@ c_migrations_have_down() {
   need_base
   local f n=0
   for f in $(added); do
-    sed -n '/migrate:down/,$p' "$f" | tail -n +2 | grep -qE '[a-zA-Z]' || die "empty or missing migrate:down in $f"
+    sed -n '/migrate:down/,$p' "$f" | tail -n +2 | grep -qE '[a-zA-Z]' || die "$f has no usable migrate:down. Every migration needs one so a kicked-back batch can roll itself back. Write the inverse, or an explicit no-op comment if truly irreversible."
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || skip "no new migrations"
@@ -142,8 +142,8 @@ EOSQL
   down "$n"; dump > /tmp/base2.sql
   up "up is not replayable after down"; dump > /tmp/head2.sql
 
-  diff -u /tmp/base1.sql /tmp/base2.sql || die "down is not the inverse of up"
-  diff -u /tmp/head1.sql /tmp/head2.sql || die "up is not replayable after down"
+  diff -u /tmp/base1.sql /tmp/base2.sql || die "up then down did not return $BASE to its original schema. The diff above shows what was left behind. Fix migrate:down to undo exactly what migrate:up does."
+  diff -u /tmp/head1.sql /tmp/head2.sql || die "up, down, up did not reproduce the same schema. The diff above shows the drift. Usually a down that drops more than its up created."
   echo "ok: $n migrations round trip up, down, up on $BASE's schema"
 }
 
@@ -152,7 +152,7 @@ c_rls() {
   local f t n=0
   for f in $(added); do
     for t in $(grep -oiE 'CREATE TABLE (IF NOT EXISTS )?public\.[a-z0-9_]+' "$f" | awk '{print $NF}'); do
-      grep -qiE "ALTER TABLE .*${t##*.}.* ENABLE ROW LEVEL SECURITY" "$f" || die "$t has no ENABLE ROW LEVEL SECURITY in $f"
+      grep -qiE "ALTER TABLE .*${t##*.}.* ENABLE ROW LEVEL SECURITY" "$f" || die "new table $t in $f has no RLS. Add: ALTER TABLE $t ENABLE ROW LEVEL SECURITY; in the same migration, or the table is readable by any authenticated role."
       n=$((n + 1))
     done
   done
@@ -170,12 +170,12 @@ c_codegen() {
       npm ci --no-audit --no-fund --ignore-scripts >/dev/null 2>&1 \
         || die "npm ci failed, so prisma generate cannot run"
     fi
-    npx --yes prisma generate >/dev/null || die "prisma generate failed"
+    npx --yes prisma generate >/dev/null || die "prisma generate failed, output above. Usually a schema.prisma that does not parse, or a generator this runner cannot fetch."
     ran=1
   fi
   if [ -f package.json ] && jq -e '.scripts.codegen' package.json >/dev/null 2>&1; then npm run codegen >/dev/null; ran=1; fi
   [ "$ran" = 1 ] || skip "no prisma schema and no codegen script"
-  git diff --exit-code || die "codegen produced a diff, commit it"
+  git diff --exit-code || die "generated files are out of date, the diff above is what changed. Run the generator locally and commit the result."
   echo "ok: codegen leaves no diff"
 }
 

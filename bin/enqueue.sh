@@ -64,36 +64,70 @@ open_prs() { # <ticket> -> "repo<TAB>number" for every OPEN PR carrying it
 
 # Green means every check reported success. A null conclusion is a check still running,
 # which is not success; treating it as one is how a gate passes a batch nobody validated.
-pr_state() { # <repo> <num> -> "mergeable review failing"
+pr_state() { # <repo> <num> -> "mergeable\treview\tfailed\trunning\tnames"
+  # Deploys are excluded: a preview that will not build says nothing about whether the
+  # code is safe to land. Running is counted separately from failed so the message can
+  # tell someone to wait rather than to go fix something.
   gh pr view "$2" -R "$ORG/$1" \
     --json mergeable,reviewDecision,statusCheckRollup \
     -q '[(.mergeable // "UNKNOWN"),
          ((.reviewDecision // "") | if . == "" then "NONE" else . end),
          ([.statusCheckRollup[]?
-           # Previews and lambda deploys are deploys, not gates. A preview that will not
-           # build means nobody can click the change; it says nothing about whether the
-           # code is safe to land, and a Railway hiccup must not hold a release.
-           | select((.name // .context // "")
-                    | test("^preview /|^lambda /|^Bluejay - ") | not)
-           | (.conclusion // .state // "PENDING") | ascii_upcase
-           | select(IN("SUCCESS","NEUTRAL","SKIPPED","CANCELLED") | not)] | length | tostring)]
+           | select((.name // .context // "") | test("^preview /|^lambda /|^Bluejay - ") | not)
+           | select((.conclusion // .state // "PENDING") | ascii_upcase
+                    | IN("SUCCESS","NEUTRAL","SKIPPED","CANCELLED") | not)
+           | select((.status // "") | IN("IN_PROGRESS","QUEUED") | not)]),
+         ([.statusCheckRollup[]?
+           | select((.name // .context // "") | test("^preview /|^lambda /|^Bluejay - ") | not)
+           | select((.status // "") | IN("IN_PROGRESS","QUEUED"))])]
+        | [.[0], .[1], (.[2]|length|tostring), (.[3]|length|tostring),
+           (([.[2][] | .name // .context] | join(", ")) // ""),
+           (([.[3][] | .name // .context] | join(", ")) // "")]
         | @tsv'
 }
 
 ready() { # <ticket> -> 0 when every sibling can merge
-  local id=$1 bad=0 this repo num st mergeable review failing n=0
+  local id=$1 bad=0 this repo num st mergeable review failed running fnames rnames n=0
+  local waiting=0
   while IFS=$'\t' read -r repo num; do
     [ -n "${repo:-}" ] || continue
     n=$((n + 1)); this=0
-    st=$(pr_state "$repo" "$num") || { warn "$repo#$num: cannot read state"; bad=1; continue; }
-    IFS=$'\t' read -r mergeable review failing <<<"$st"
-    [ "$mergeable" = MERGEABLE ] || { warn "$repo#$num: $mergeable"; this=1; }
-    [ "$review" = APPROVED ]     || { warn "$repo#$num: review $review"; this=1; }
-    [ "$failing" = 0 ]           || { warn "$repo#$num: $failing checks not green"; this=1; }
+    st=$(pr_state "$repo" "$num") || { warn "  $repo#$num: cannot read its state from GitHub"; bad=1; continue; }
+    IFS=$'\t' read -r mergeable review failed running fnames rnames <<<"$st"
+    local url="https://github.com/$ORG/$repo/pull/$num"
+
+    case "$mergeable" in
+      MERGEABLE) ;;
+      CONFLICTING) warn "  $repo#$num has conflicts with main. Rebase it: $url"; this=1 ;;
+      *)          warn "  $repo#$num mergeable=$mergeable (GitHub has not finished computing this; try again shortly): $url"; this=1 ;;
+    esac
+
+    case "$review" in
+      APPROVED) ;;
+      NONE)     warn "  $repo#$num has no approving review. This repo does not require one, but a batch does: $url"; this=1 ;;
+      *)        warn "  $repo#$num review is $review: $url"; this=1 ;;
+    esac
+
+    if [ "${running:-0}" != 0 ]; then
+      warn "  $repo#$num is still running: $rnames"
+      warn "      Nothing is wrong, it just has not finished. Wait and run this again."
+      waiting=1; this=1
+    fi
+    if [ "${failed:-0}" != 0 ]; then
+      warn "  $repo#$num has failing checks: $fnames"
+      warn "      $url/checks"
+      this=1
+    fi
+
     [ "$this" = 0 ] && say "  ok $repo#$num" || bad=1
   done < <(open_prs "$id")
-  # No PRs at all is not a ready batch: it means the id is wrong.
-  [ "$n" -gt 0 ] || { warn "no open PRs carry $id"; return 1; }
+
+  [ "$n" -gt 0 ] || { warn "No open PR has $id in its title. Check the id, or the PRs were already merged."; return 1; }
+  if [ "$bad" != 0 ]; then
+    [ "$waiting" = 1 ] \
+      && warn "$id is not ready: something is still running. Deploys (preview, lambda) are ignored, so this is a real check." \
+      || warn "$id is not ready. Fix the PRs named above, then run this again."
+  fi
   return $bad
 }
 
@@ -221,7 +255,7 @@ cmd_check() {
 cmd_run() {
   local id=${1:-}; [ -n "$id" ] || { warn "usage: enqueue.sh run <ENG-123> [order]"; exit 2; }
   say "batch $id"
-  ready "$id" || die "batch is not ready, nothing merged"
+  ready "$id" || die "$id was not merged. Nothing changed on main."
 
   # The design says a batch is proved against an environment before it merges. That
   # environment does not exist yet (previews moved to full stacks, blocked on the CI IAM
