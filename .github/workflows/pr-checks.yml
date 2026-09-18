@@ -141,6 +141,23 @@ jobs:
             echo "no package.json"
           fi
 
+  # codegen runs the repo's own generator, and a same-repo PR controls that script.
+  # It therefore gets its own job with NO secrets: anything it can reach, a PR author
+  # can reach. The credentialed steps stay in `deterministic`.
+  codegen:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      DIRECT_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bluejay-ai-dev/bluejay-github-actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .gating
+      - run: .gating/bin/checks.sh codegen
+
   deterministic:
     runs-on: ubuntu-latest
     services:
@@ -191,6 +208,5 @@ jobs:
       - { if: always(), name: migrations-have-down,  run: .gating/bin/checks.sh migrations-have-down }
       - { if: always(), name: migrations-round-trip, run: .gating/bin/checks.sh migrations-round-trip }
       - { if: always(), name: rls,                   run: .gating/bin/checks.sh rls }
-      - { if: always(), name: codegen,               run: .gating/bin/checks.sh codegen }
       - { if: always(), name: env-vars,              run: .gating/bin/checks.sh env-vars }
       - { if: always(), name: deps-bounded,          run: .gating/bin/checks.sh deps-bounded }
