@@ -141,12 +141,15 @@ jobs:
           # Two transient failures land here: the name not yet free, and the workspace cap
           # of one environment per 30 seconds. Retry on anything, since by this point the
           # delete has already happened and giving up leaves the ticket with nothing.
+          # Budget has to outlast the cap times the number of repos on the ticket: seven
+          # repos pushing together need over 200s, and 20x6 gave up at 120. The jitter
+          # stops the callers re-colliding on the same 30s boundary every round.
           created=0 err=""
-          for _ in $(seq 1 20); do
+          for _ in $(seq 1 30); do
             if err=$(railway environment new "$ENV_NAME" --duplicate "$BASE_ENV" "${args[@]}" 2>&1); then
               created=1; break
             fi
-            sleep 6
+            sleep $(( 12 + RANDOM % 9 ))
           done
           [ "$created" = 1 ] \
             || { echo "::error::could not create $ENV_NAME: $(tail -2 <<<"$err")"; exit 1; }
