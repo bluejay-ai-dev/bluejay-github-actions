@@ -147,7 +147,14 @@ jobs:
           docker buildx create --use --name preview >/dev/null 2>&1 || docker buildx use preview
           # Lambda cannot read the OCI index buildx emits with attestations attached, so
           # the image has to be built without them or CreateFunction rejects it.
+          # evals' Dockerfile pulls the prod ffmpeg artifact from S3 at build time and
+          # reads these from /run/secrets. configure-aws-credentials already exported the
+          # OIDC session, so pass it through rather than minting anything new. Repos whose
+          # Dockerfile declares no secrets simply ignore them.
           docker buildx build --platform linux/arm64 --provenance=false --sbom=false \
+            --secret id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+            --secret id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+            --secret id=aws_session_token,env=AWS_SESSION_TOKEN \
             -t "$uri" --push . \
             || { echo "::error::image build failed"; exit 1; }
 
