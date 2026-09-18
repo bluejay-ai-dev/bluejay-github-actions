@@ -119,6 +119,20 @@ jobs:
             [ -z "${repo:-}" ] && continue
             if [ "$repo" = "$SELF" ] && [ "$num" = "$NUM" ]; then continue; fi
             found=1
+            # Wait for the sibling to settle before judging it. Every repo on a ticket
+            # pushes at once, so a snapshot catches the others mid-flight and calls a
+            # running check red, which made this fail on every multi-repo ticket.
+            running=1
+            for _ in $(seq 1 40); do
+              running=$(gh pr view "$num" -R "$OWNER/$repo" --json statusCheckRollup \
+                -q '[.statusCheckRollup[]
+                     | select((.name // .context // "") | test("related-prs-green") | not)
+                     | select((.status // "") | IN("IN_PROGRESS","QUEUED"))]
+                    | length')
+              [ "${running:-0}" = 0 ] && break
+              sleep 20
+            done
+            [ "${running:-0}" = 0 ] || echo "- \`$repo#$num\` still running after 13 min, judging as-is" >> "$GITHUB_STEP_SUMMARY"
             bad=$(gh pr view "$num" -R "$OWNER/$repo" --json statusCheckRollup \
               -q '[.statusCheckRollup[]
                    | select((.name // .context // "") | test("related-prs-green") | not)
