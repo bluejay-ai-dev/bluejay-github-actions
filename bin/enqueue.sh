@@ -97,7 +97,14 @@ ready() { # <ticket> -> 0 when every sibling can merge
     local url="https://github.com/$ORG/$repo/pull/$num"
 
     case "$mergeable" in
-      MERGEABLE) ;;
+      MERGEABLE/CLEAN|MERGEABLE/UNSTABLE|MERGEABLE/HAS_HOOKS) ;;
+      MERGEABLE/BLOCKED)
+        warn "  $repo#$num is approved and green but GitHub will refuse the merge: branch protection is blocking it."
+        warn "      Usually an unresolved review thread. Open $url and resolve the conversations."
+        this=1 ;;
+      MERGEABLE/BEHIND)
+        warn "  $repo#$num is behind main and the repo requires up-to-date branches. Update it: $url"
+        this=1 ;;
       CONFLICTING) warn "  $repo#$num has conflicts with main. Rebase it: $url"; this=1 ;;
       *)          warn "  $repo#$num mergeable=$mergeable (GitHub has not finished computing this; try again shortly): $url"; this=1 ;;
     esac
