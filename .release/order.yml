@@ -1,0 +1,5 @@
+# Promotion order. Workflows here are consumed at @main, so merging is the ship.
+# There is no separate deploy signal to wait on. When a batch also touches app repos
+# that call these workflows at @main, put ga first via the order override.
+after: []
+deploys: false
