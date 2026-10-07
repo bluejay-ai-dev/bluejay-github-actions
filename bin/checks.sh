@@ -24,6 +24,18 @@ linear() {  # linear <ENG-123> <fields> -> raw graphql response
     -d "$(jq -nc --arg i "$1" --arg q "query(\$i:String!){issue(id:\$i){$2}}" '{query:$q,variables:{i:$i}}')"
 }
 
+ticket_repos() {  # repos with a PR on ticket $1, this repo included
+  local r=""
+  if [ -n "${GH_TOKEN:-}" ]; then
+    r=$(gh search prs --owner "${OWNER:-${GITHUB_REPOSITORY_OWNER:-}}" --match title "$1" --limit 50 \
+          --json repository,title \
+          -q ".[] | select(.title | test(\"\\\\b$1\\\\b\"; \"i\")) | .repository.name" 2>/dev/null | tr '\n' ' ') || return 1
+  else
+    echo "no GH_TOKEN, the PR set is this repo only" >&2
+  fi
+  echo "$r ${GITHUB_REPOSITORY##*/}"
+}
+
 need_base() { git rev-parse --verify -q "$REF" >/dev/null || die "$REF is not fetched, checkout needs fetch-depth: 0"; }
 
 c_ticket_sane() {
@@ -46,20 +58,32 @@ c_video() {
   id=$(ticket_id)
   [ -n "$id" ] || skip "no ticket id in the title"
   [ "${ADDITIONS:-0}" -gt 100 ] || skip "${ADDITIONS:-0} additions, under 100, no video required"
-  if [ -n "${GH_TOKEN:-}" ]; then
-    repos=$(gh search prs --owner "${OWNER:-${GITHUB_REPOSITORY_OWNER:-}}" --match title "$id" --limit 50 \
-              --json repository,title \
-              -q ".[] | select(.title | test(\"\\\\b$id\\\\b\"; \"i\")) | .repository.name" 2>/dev/null | tr '\n' ' ' || true)
-  else
-    echo "no GH_TOKEN, the PR set is this repo only"
-  fi
-  repos="$repos ${GITHUB_REPOSITORY##*/}"
+  repos=$(ticket_repos "$id") || repos=" ${GITHUB_REPOSITORY##*/}"
   case "$repos" in *frontend*) ;; *) skip "no frontend repo on $id (${repos# }), no video required" ;; esac
   if grep -qE "$VIDEO" <<<"${BODY:-}"; then echo "ok: video in the PR body"; return 0; fi
   [ -n "${LINEAR_API_KEY:-}" ] || die "no video in the PR body and LINEAR_API_KEY not set, cannot read $id"
   d=$(linear "$id" description | jq -r '.data.issue.description // ""')
   grep -qE "$VIDEO" <<<"$d" || die "frontend change with ${ADDITIONS} additions needs a video on $id or in the PR body"
   echo "ok: video on $id"
+}
+
+# Backend-only tickets have nothing to show, so only a frontend ticket needs one.
+c_visuals() {
+  local id repos b
+  id=$(ticket_id)
+  if [ -n "$id" ]; then
+    # Fail closed: a failed lookup still requires a visual.
+    repos=$(ticket_repos "$id") || die "could not list the PRs on $id, add a visual or the 'no-visual' label"
+    case "$repos" in *frontend*) ;; *) skip "no frontend repo on $id (${repos# }), no visual required" ;; esac
+  fi
+  # cubic appends its own block with an <img> review button. Counting that as
+  # the author's screenshot passed this check on every cubic-reviewed PR.
+  b=$(python3 -c 'import os,re; print(re.sub(r"<!-- This is an auto-generated description by cubic\. -->.*?<!-- End of auto-generated description by cubic\. -->","",os.environ.get("BODY",""),flags=re.S))')
+  # markdown image, html img/video, or a github attachment link
+  if grep -qiE '!\[[^]]*\]\([^)]+\)|<img |<video |user-attachments/assets/|githubusercontent\.com' <<<"$b"; then
+    echo "ok: visual in the PR body"; return 0
+  fi
+  die "no screenshot or video in the PR body. Nothing to show? Add the 'no-visual' label."
 }
 
 # dbmate keys on the version prefix and skips applied versions, so an edited
@@ -278,7 +302,7 @@ c_deps_bounded() {
 
 cmd=${1:-}
 case "$cmd" in
-  ticket-sane|video|migrations-immutable|migrations-newest|migrations-have-down|\
+  ticket-sane|video|visuals|migrations-immutable|migrations-newest|migrations-have-down|\
   migrations-round-trip|migrations-expand-only|rls|codegen|env-vars|deps-bounded) "c_${cmd//-/_}" ;;
-  *) echo "usage: checks.sh <ticket-sane|video|migrations-immutable|migrations-newest|migrations-have-down|migrations-round-trip|migrations-expand-only|rls|codegen|env-vars|deps-bounded>"; exit 2 ;;
+  *) echo "usage: checks.sh <ticket-sane|video|visuals|migrations-immutable|migrations-newest|migrations-have-down|migrations-round-trip|migrations-expand-only|rls|codegen|env-vars|deps-bounded>"; exit 2 ;;
 esac
