@@ -8,6 +8,7 @@ BASE=${BASE:-main}
 REF="origin/$BASE"
 MIG=db/migrations
 VIDEO='node-type="video"|loom\.com/share/'
+FRONTEND='bluejay_frontend_v2 bluejay-ai-dashboard'
 DBMATE_VERSION=v2.33.0
 DBMATE_SHA256=dfd4027141b6e4357158099bdfe6c02b286af70f8e49057937744cf80b38ea1c
 
@@ -36,6 +37,12 @@ ticket_repos() {  # repos with a PR on ticket $1, this repo included
   echo "$r ${GITHUB_REPOSITORY##*/}"
 }
 
+has_frontend() {  # has_frontend "<repos>"
+  local r
+  for r in $1; do case " $FRONTEND " in *" $r "*) return 0 ;; esac; done
+  return 1
+}
+
 need_base() { git rev-parse --verify -q "$REF" >/dev/null || die "$REF is not fetched, checkout needs fetch-depth: 0"; }
 
 c_ticket_sane() {
@@ -59,7 +66,7 @@ c_video() {
   [ -n "$id" ] || skip "no ticket id in the title"
   [ "${ADDITIONS:-0}" -gt 100 ] || skip "${ADDITIONS:-0} additions, under 100, no video required"
   repos=$(ticket_repos "$id") || repos=" ${GITHUB_REPOSITORY##*/}"
-  case "$repos" in *frontend*) ;; *) skip "no frontend repo on $id (${repos# }), no video required" ;; esac
+  has_frontend "$repos" || skip "no frontend repo on $id (${repos# }), no video required"
   if grep -qE "$VIDEO" <<<"${BODY:-}"; then echo "ok: video in the PR body"; return 0; fi
   [ -n "${LINEAR_API_KEY:-}" ] || die "no video in the PR body and LINEAR_API_KEY not set, cannot read $id"
   d=$(linear "$id" description | jq -r '.data.issue.description // ""')
@@ -67,14 +74,12 @@ c_video() {
   echo "ok: video on $id"
 }
 
-# Backend-only tickets have nothing to show, so only a frontend ticket needs one.
 c_visuals() {
   local id repos b
   id=$(ticket_id)
   if [ -n "$id" ]; then
-    # Fail closed: a failed lookup still requires a visual.
     repos=$(ticket_repos "$id") || die "could not list the PRs on $id, add a visual or the 'no-visual' label"
-    case "$repos" in *frontend*) ;; *) skip "no frontend repo on $id (${repos# }), no visual required" ;; esac
+    has_frontend "$repos" || skip "no frontend repo on $id (${repos# }), no visual required"
   fi
   # cubic appends its own block with an <img> review button. Counting that as
   # the author's screenshot passed this check on every cubic-reviewed PR.

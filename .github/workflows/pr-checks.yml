@@ -71,7 +71,6 @@ jobs:
       BODY: ${{ github.event.pull_request.body }}
       GH_TOKEN: ${{ secrets.SANDBOX_GH_TOKEN }}
     steps:
-      # Only the scripts, never the PR: this job holds a token.
       - uses: actions/checkout@v4
         with:
           repository: bluejay-ai-dev/bluejay-github-actions
