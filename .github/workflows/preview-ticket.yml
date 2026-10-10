@@ -29,9 +29,9 @@ env:
   PROJECT: 7047af18-477f-42e0-a905-f2e8f7ccac0f
   BASE_ENV: preview-base
   BASE_ENV_ID: 0a1b75a1-8402-418a-8192-00fe1613ec14
-  # Repos that are Railway services in preview-base. Others are lambdas, handled by
-  # preview-lambda.yml, or have no preview surface at all.
-  RAILWAY_REPOS: bluejay_middleware:middleware bluejay_frontend_v2:frontend
+  # preview-base is the permanent environment: every registered service on main, always
+  # on. Its service list is the registry, read at run time, so adding a service there
+  # (plus the repo's preview.yml caller) is the whole setup. Lambdas are preview-lambda.yml.
 
 jobs:
   ticket:
@@ -42,10 +42,19 @@ jobs:
         id: t
         env:
           GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           REPO: ${{ inputs.repo }}
           PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
+          RAILWAY_REPOS=$(curl -fsS --max-time 20 https://backboard.railway.com/graphql/v2 \
+            -H "Authorization: Bearer $RAILWAY_API_TOKEN" -H 'content-type: application/json' \
+            -d "$(jq -nc --arg id "$BASE_ENV_ID" '{query:"query($id:String!){environment(id:$id){serviceInstances{edges{node{serviceName source{repo}}}}}}",variables:{id:$id}}')" \
+            | jq -r '[.data.environment.serviceInstances.edges[].node | select(.source.repo)
+                      | "\(.source.repo | split("/")[1]):\(.serviceName)"] | join(" ")')
+          [ -n "$RAILWAY_REPOS" ] || { echo "::error::could not read the services in $BASE_ENV"; exit 1; }
+          echo "services in $BASE_ENV: $RAILWAY_REPOS"
+          echo "RAILWAY_REPOS=$RAILWAY_REPOS" >> "$GITHUB_ENV"
           title=$(gh pr view "$PR" -R "$ORG/$REPO" --json title -q .title)
           ticket=$(grep -oiE '\b[A-Z]+-[0-9]+\b' <<<"$title" | head -1 | tr '[:lower:]' '[:upper:]' || true)
           if [ -z "$ticket" ]; then
@@ -124,7 +133,10 @@ jobs:
             br=$(gh pr list -R "$ORG/$r" --state open --search "$TICKET in:title" --limit 10 \
                  --json number,title,headRefName \
                  -q "first(.[] | select((.title | test(\"(^|[^A-Za-z0-9])$TICKET([^0-9]|\$)\";\"i\")) and ((.headRefName + .title) | contains(\"--np\") | not)) | .headRefName) // \"\"")
-            [ -n "$br" ] || { echo "$r: main (untouched)"; continue; }
+            # preview-base is the permanent environment and runs every worker on main. A
+            # preview shares its data, so only the services the ticket changed run there;
+            # the rest idle (workers read PREVIEW_IDLE, everything else ignores it).
+            [ -n "$br" ] || { echo "$r: main (untouched)"; args+=(--service-config "$svc" variables.PREVIEW_IDLE.value 1); continue; }
             echo "$r: $br"
             args+=(--service-config "$svc" source.branch "$br")
             touched="$touched $r"
