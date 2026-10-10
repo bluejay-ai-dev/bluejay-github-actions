@@ -51,6 +51,7 @@ jobs:
             -H "Authorization: Bearer $RAILWAY_API_TOKEN" -H 'content-type: application/json' \
             -d "$(jq -nc --arg id "$BASE_ENV_ID" '{query:"query($id:String!){environment(id:$id){serviceInstances{edges{node{serviceName source{repo}}}}}}",variables:{id:$id}}')" \
             | jq -r '[.data.environment.serviceInstances.edges[].node | select(.source.repo)
+                      | select([.serviceName, .source.repo] | all(test("^[A-Za-z0-9._/-]+$")))
                       | "\(.source.repo | split("/")[1]):\(.serviceName)"] | join(" ")')
           [ -n "$RAILWAY_REPOS" ] || { echo "::error::could not read the services in $BASE_ENV"; exit 1; }
           echo "services in $BASE_ENV: $RAILWAY_REPOS"
