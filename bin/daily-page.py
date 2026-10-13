@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Page PagerDuty when the nightly is red, resolve it when the nightly is green again.
+"""Page PagerDuty when the daily is red, resolve it when the daily is green again.
 
-  VERDICT=red ROUTING_KEY=... RUN_URL=... nightly-page.py /tmp/out
+  VERDICT=red ROUTING_KEY=... RUN_URL=... daily-page.py /tmp/out
 """
 import json, os, re, sys, time, urllib.request
 
@@ -26,8 +26,8 @@ run_url, verdict = os.environ["RUN_URL"], os.environ["VERDICT"] or "red"
 key = os.environ.get("ROUTING_KEY", "")
 if not key:
     if verdict == "red":
-        sys.exit("NIGHTLY_PAGERDUTY_ROUTING_KEY is unset, nobody was paged")
-    print("NIGHTLY_PAGERDUTY_ROUTING_KEY is unset, nothing to resolve")
+        sys.exit("DAILY_PAGERDUTY_ROUTING_KEY is unset, nobody was paged")
+    print("DAILY_PAGERDUTY_ROUTING_KEY is unset, nothing to resolve")
     sys.exit(0)
 
 m = re.search(r"^FAIL: (.*) in \d+s$", out, re.M)
@@ -40,21 +40,21 @@ nice = lambda p: f"{p[5:]} call" if p.startswith("call:") else p
 exercises = lambda p: (f"middleware dispatcher, LiveKit DH workers on EC2, {p[5:]} itself"
                        if p.startswith("call:") else EXERCISES.get(p, "see the run log"))
 
-title = (f"Nightly prod test failed {len(failed)} of {len(failed) + len(passed)} parts: "
-         + ", ".join(map(nice, failed))) if failed else "Nightly prod test failed before reporting any part"
+title = (f"Daily prod test failed {len(failed)} of {len(failed) + len(passed)} parts: "
+         + ", ".join(map(nice, failed))) if failed else "Daily prod test failed before reporting any part"
 event = {
     "routing_key": key,
     "event_action": "trigger" if verdict == "red" else "resolve",
-    "dedup_key": "bluejay-nightly-prod",
+    "dedup_key": "bluejay-daily-prod",
     "payload": {
         "summary": title[:1000],
-        "source": "bluejay-github-actions nightly",
+        "source": "bluejay-github-actions daily",
         "severity": "critical",
         "component": "prod",
         "group": "platform",
-        "class": "nightly",
+        "class": "daily",
         "custom_details": {
-            "What this means": "The nightly suite ran real sign-ups, sims and calls against prod and "
+            "What this means": "The daily suite ran real sign-ups, sims and calls against prod and "
                                "these parts failed. Only a dropped or unanswered call gets a retry, so this is "
                                "very likely a real outage, not a flake.",
             "Customer impact": "Customers using the failed parts may see their simulations, calls or "
@@ -68,15 +68,15 @@ event = {
             },
             "First steps to triage": [
                 "1. Open the GitHub run and read the FAIL lines in the summary; the artifact has the full log and screenshots.",
-                "2. Re-run only the failed parts: Actions, nightly, Run workflow, parts = the names above "
+                "2. Re-run only the failed parts: Actions, daily, Run workflow, parts = the names above "
                 "(a provider call is call:<name>). Green on re-run means a flake; it resolves this page.",
                 "3. A call that never dispatched or ended NO_CONNECTION: check the LiveKit DH workers on EC2 "
                 "(us-west-1) and the middleware dispatcher logs on Railway. One provider only: check that provider's status page and its key (creds).",
                 "4. text, webchat or sms stuck or COMPLETED with no metrics: check middleware and text_agent on Railway, "
                 "then the evals queue and ClickHouse.",
-                "5. Look for Sentry errors in the same window, and for a prod release that went out since the last green night.",
+                "5. Look for Sentry errors in the same window, and for a prod release that went out since the last green run.",
             ],
-            "Resolves when": "The next nightly, or a manual re-run of the failed parts, comes back green.",
+            "Resolves when": "The next daily, or a manual re-run of the failed parts, comes back green.",
         },
     },
     "links": [{"href": run_url, "text": "GitHub run"}],

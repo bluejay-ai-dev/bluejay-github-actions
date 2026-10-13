@@ -81,7 +81,7 @@ export async function loggedInContext(BASE, { viewport = { width: 1600, height: 
   return { browser, ctx, session };
 }
 
-// Admin helpers for the nightly, which needs a user that did not exist yesterday.
+// Admin helpers for the daily, which needs a user that did not exist yesterday.
 function adminHeaders() {
   const service = need("SUITE_SUPABASE_SERVICE_KEY");
   return { apikey: service, Authorization: `Bearer ${service}`, "Content-Type": "application/json" };
@@ -98,7 +98,7 @@ export async function createUser(email, password) {
   return b.id;
 }
 
-// Best effort on purpose: a nightly that fails because cleanup failed is a nightly people
+// Best effort on purpose: a daily that fails because cleanup failed is a daily people
 // mute. The leak is one row, and the sweep below catches it tomorrow.
 export async function deleteUser(id) {
   const supaUrl = need("SUITE_SUPABASE_URL").replace(/\/$/, "");

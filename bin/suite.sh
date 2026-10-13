@@ -115,7 +115,7 @@ cmd_preflight() {
   done
   touched 'red.?team' && need TEST_SUITE_AGENT_REDTEAM >/dev/null
   touched 'uptime'    && need TEST_SUITE_MONITOR_ID >/dev/null
-  if [ -n "${SUITE_NIGHTLY:-}" ]; then
+  if [ -n "${SUITE_DAILY:-}" ]; then
     need TEST_SUITE_SIM_WEBCHAT >/dev/null
     need TEST_SUITE_PROVIDERS >/dev/null
     jq -e 'type == "array" and length > 0 and all(.name | test("^[a-z0-9_-]+$"))' <<<"$TEST_SUITE_PROVIDERS" >/dev/null \
@@ -424,7 +424,7 @@ cmd_call() {
 }
 
 # Proves the red-team pipeline dispatches, which is all a merge gate should claim. A run
-# that actually red teams is a nightly job: every probe here is a real billed voice call,
+# that actually red teams is a daily job: every probe here is a real billed voice call,
 # so it is capped at one and stopped as soon as it is moving.
 cmd_redteam() {
   local agent; agent=$(need TEST_SUITE_AGENT_REDTEAM)
@@ -470,8 +470,8 @@ attempt() {
   [ $rc = $E_AMBER ] || return $rc
   note "amber, one retry"
   SUITE_ATTEMPT=2 "$@"; rc=$?
-  # The gate blocks on amber twice. The nightly reports it and does not page.
-  [ $rc = $E_AMBER ] && [ -z "${SUITE_NIGHTLY:-}" ] && rc=$E_FAIL
+  # The gate blocks on amber twice. The daily reports it and does not page.
+  [ $rc = $E_AMBER ] && [ -z "${SUITE_DAILY:-}" ] && rc=$E_FAIL
   return $rc
 }
 
@@ -485,7 +485,7 @@ cmd_run() {
   cmd_preflight || exit $?
   local skip=" " prc calls
   calls=$(provider_parts | tr '\n' ' ')
-  # The gate has no webchat or provider fixtures; the nightly's preflight requires them.
+  # The gate has no webchat or provider fixtures; the daily's preflight requires them.
   [ -n "${TEST_SUITE_SIM_WEBCHAT:-}" ] || skip+="webchat "
   for part in sha creds signup text webchat sms traces browser bluejayai outbound inbound $calls; do
     [[ $skip == *" $part "* ]] && { note "skipped $part"; continue; }
@@ -544,7 +544,7 @@ cmd_selftest() {
   red()   { n=$((n + 1)); return $E_FAIL; }
   attempt amber; chk "amber rc" "$?" "$E_FAIL"; chk "amber tries" "$n" 2
   n=0; attempt red; chk "red rc" "$?" "$E_FAIL"; chk "red tries" "$n" 1
-  n=0; SUITE_NIGHTLY=1 attempt amber; chk "nightly amber rc" "$?" "$E_AMBER"; chk "nightly amber tries" "$n" 2
+  n=0; SUITE_DAILY=1 attempt amber; chk "daily amber rc" "$?" "$E_AMBER"; chk "daily amber tries" "$n" 2
   chk "provider parts" "$(TEST_SUITE_PROVIDERS='[{"name":"vapi"},{"name":"retell"}]' provider_parts | tr '\n' ' ')" "call:vapi call:retell "
 
   [ $f = 0 ] && ok selftest "classifier and retry rule" || return $E_FAIL

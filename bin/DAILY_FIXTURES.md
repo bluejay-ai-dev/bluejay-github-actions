@@ -1,6 +1,6 @@
-# Nightly prod fixtures
+# Daily prod fixtures
 
-What a person has to create in prod and set on this repo before `nightly.yml` goes green.
+What a person has to create in prod and set on this repo before `daily.yml` goes green.
 `suite.sh preflight` checks every item below and ends the run as `fixture` (never paged)
 when one is missing. All commands take `-R bluejay-ai-dev/bluejay-github-actions`.
 
@@ -12,7 +12,7 @@ when one is missing. All commands take `-R bluejay-ai-dev/bluejay-github-actions
    read another's traces.
 3. **Fixture user.** A user that is a member of org A. Sign-in goes through a service-role
    magic link, so no password is needed. signup.mjs makes and deletes its own throwaway
-   account at `gate+signup-*@bluejaysims.com` each night.
+   account at `gate+signup-*@bluejaysims.com` each run.
 4. **Text agent and sim.** A TEXT agent with `http_webhook` set to the hosted echo, plus a
    simulation with one digital human and at least one metric.
 5. **Webchat agent and sim.** A TEXT agent with connection type `OPENAI_CHAT`
@@ -37,13 +37,13 @@ when one is missing. All commands take `-R bluejay-ai-dev/bluejay-github-actions
 ## Secrets
 
 ```
-gh secret set NIGHTLY_BLUEJAY_API_KEY          # org A API key
-gh secret set NIGHTLY_BLUEJAY_API_KEY_B        # org B API key
-gh secret set NIGHTLY_USER_EMAIL               # fixture user's email
+gh secret set DAILY_BLUEJAY_API_KEY          # org A API key
+gh secret set DAILY_BLUEJAY_API_KEY_B        # org B API key
+gh secret set DAILY_USER_EMAIL               # fixture user's email
 gh secret set PROD_SUPABASE_URL
 gh secret set PROD_SUPABASE_ANON_KEY
 gh secret set PROD_SUPABASE_SERVICE_KEY
-gh secret set NIGHTLY_PAGERDUTY_ROUTING_KEY    # Events API v2 routing key
+gh secret set DAILY_PAGERDUTY_ROUTING_KEY    # Events API v2 routing key
 ```
 
 ## Variables
@@ -51,19 +51,19 @@ gh secret set NIGHTLY_PAGERDUTY_ROUTING_KEY    # Events API v2 routing key
 ```
 gh variable set PROD_FRONTEND_URL        # https://app.getbluejay.ai
 gh variable set PROD_API_URL             # prod middleware base URL
-gh variable set NIGHTLY_AGENT_ID         # any org A agent id, read only
-gh variable set NIGHTLY_SIM_TEXT         # item 4
-gh variable set NIGHTLY_ECHO_URL         # the echo the text agent posts to
-gh variable set NIGHTLY_SIM_WEBCHAT      # item 5
-gh variable set NIGHTLY_SIM_SMS          # item 6
-gh variable set NIGHTLY_SIM_OUTBOUND     # item 7
-gh variable set NIGHTLY_AGENT_OUTBOUND
-gh variable set NIGHTLY_SIM_INBOUND      # item 8
-gh variable set NIGHTLY_AGENT_INBOUND
-gh variable set NIGHTLY_PROVIDERS        # item 9, see below
+gh variable set DAILY_AGENT_ID         # any org A agent id, read only
+gh variable set DAILY_SIM_TEXT         # item 4
+gh variable set DAILY_ECHO_URL         # the echo the text agent posts to
+gh variable set DAILY_SIM_WEBCHAT      # item 5
+gh variable set DAILY_SIM_SMS          # item 6
+gh variable set DAILY_SIM_OUTBOUND     # item 7
+gh variable set DAILY_AGENT_OUTBOUND
+gh variable set DAILY_SIM_INBOUND      # item 8
+gh variable set DAILY_AGENT_INBOUND
+gh variable set DAILY_PROVIDERS        # item 9, see below
 ```
 
-`NIGHTLY_PROVIDERS` is a JSON list with one entry per provider. Names are lowercase and
+`DAILY_PROVIDERS` is a JSON list with one entry per provider. Names are lowercase and
 appear in the page title as "vapi call":
 
 ```
@@ -73,4 +73,4 @@ appear in the page title as "vapi call":
 ## Checking it
 
 Run the workflow by hand with `parts` = `preflight`. It lists the first missing item as a
-`MISS` line. Then run it with `parts` blank for a full night.
+`MISS` line. Then run it with `parts` blank for a full run.
