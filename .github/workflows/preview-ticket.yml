@@ -181,6 +181,12 @@ jobs:
           pw=$(openssl rand -hex 24); echo "::add-mask::$pw"
           sb -X PATCH "$api/projects/$bref/database/password" -d "$(jq -nc --arg p "$pw" '{password:$p}')" >/dev/null \
             || { echo "::error::could not set the db branch password"; exit 1; }
+          # the pooler takes ~20s to accept a new password
+          for _ in $(seq 1 18); do
+            PGPASSWORD="$pw" psql "host=$PREVIEW_PG_HOST port=5432 user=postgres.$bref dbname=postgres sslmode=require connect_timeout=10" \
+              -X -A -t -c 'select 1' >/dev/null 2>&1 && break
+            sleep 10
+          done
           keys=$(sb "$api/projects/$bref/api-keys?reveal=true")
           anon=$(jq -r '.[]|select(.name=="anon").api_key' <<<"$keys"); svckey=$(jq -r '.[]|select(.name=="service_role").api_key' <<<"$keys")
           echo "::add-mask::$anon"; echo "::add-mask::$svckey"
