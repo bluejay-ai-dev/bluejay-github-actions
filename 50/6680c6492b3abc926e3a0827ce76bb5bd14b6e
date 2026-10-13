@@ -1,0 +1,19 @@
+.github/workflows/preview-ticket.yml
+  s_f9c7626dcaf1f6::t_c39326306892cd 32-35,125-131,161-223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "506680c6492b3abc926e3a0827ce76bb5bd14b6e",
+  "prompts": {},
+  "sessions": {
+    "s_f9c7626dcaf1f6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "38690be8-3e5f-4dc5-8daf-8d55f5e0a5eb",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Lorenzo Taylor <lmtaylor9@dons.usfca.edu>"
+    }
+  }
+}
