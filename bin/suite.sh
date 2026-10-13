@@ -250,7 +250,7 @@ http_text() {
     echo "SUITE_SIM_ID=$sim"; echo "SUITE_RUN_ID=$run"; echo "SUITE_RESULT_ID=$rid"
     jq -r '[.. | objects | select(has("speaker") or has("role"))][0]
            | (.utterance // .text // .content // "") | .[0:40]
-           | "SUITE_EXPECT_TEXT=" + .' /tmp/suite.tx 2>/dev/null
+           | "SUITE_EXPECT_TEXT=" + @sh' /tmp/suite.tx 2>/dev/null
   } > /tmp/suite.text.env
   ok "$part" "run $run, $turns turns, $evals metric results"
 }
@@ -282,7 +282,8 @@ cmd_sms() {
   fi
   local inb outb
   inb=$(jq '[.. | objects | select((.speaker // .role // "") | test("agent|assistant";"i"))] | length' /tmp/suite.sms 2>/dev/null)
-  outb=$(jq '[.. | objects | select((.speaker // .role // "") | test("human|user|digital|bluejay";"i"))] | length' /tmp/suite.sms 2>/dev/null)
+  # The digital human's turns carry its own name as the speaker, so count everything not the agent.
+  outb=$(jq '[.. | objects | select(has("speaker") or has("role")) | select((.speaker // .role) | test("agent|assistant";"i") | not)] | length' /tmp/suite.sms 2>/dev/null)
   [ "${inb:-0}" -ge 2 ] && [ "${outb:-0}" -ge 2 ] || { bad sms "$inb in / $outb out, expected >= 2 each"; return $E_FAIL; }
   ok sms "$s, $inb in / $outb out"
 }
