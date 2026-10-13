@@ -42,6 +42,8 @@ exercises = lambda p: (f"middleware dispatcher, LiveKit DH workers on EC2, {p[5:
 
 title = (f"Daily prod test failed {len(failed)} of {len(failed) + len(passed)} parts: "
          + ", ".join(map(nice, failed))) if failed else "Daily prod test failed before reporting any part"
+if verdict == "green":
+    title = "Daily prod test passed"
 event = {
     "routing_key": key,
     "event_action": "trigger" if verdict == "red" else "resolve",
@@ -84,7 +86,7 @@ event = {
 for attempt in range(3):
     try:
         urllib.request.urlopen(urllib.request.Request(
-            "https://events.pagerduty.com/v2/enqueue", json.dumps(event).encode(),
+            os.environ.get("PAGERDUTY_EVENTS_URL", "https://events.pagerduty.com/v2/enqueue"), json.dumps(event).encode(),
             {"Content-Type": "application/json"}), timeout=10)
         print(f"{event['event_action']}: {title}")
         break
