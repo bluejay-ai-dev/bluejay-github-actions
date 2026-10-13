@@ -1,0 +1,91 @@
+name: deploy-dev
+
+# Merges a branch into the caller's `dev` and pushes it, so that repo's existing
+# push-to-dev deploys run: the Railway dev services, the dev Lambdas, dev migrations.
+#
+# Merge, never reset. `dev` holds commits main does not have, and a reset deletes them.
+#
+# A push made with GITHUB_TOKEN starts no other workflow, so without DEV_SYNC_TOKEN the
+# Railway services still deploy (Railway reads the webhook) but the Lambda and migration
+# workflows do not.
+
+on:
+  workflow_call:
+    inputs:
+      branch: { required: true, type: string }
+    secrets:
+      DEV_SYNC_TOKEN: { required: false }
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: deploy-dev-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      BRANCH: ${{ inputs.branch }}
+      HAS_SYNC_TOKEN: ${{ secrets.DEV_SYNC_TOKEN != '' }}
+    steps:
+      - name: Validate
+        run: |
+          set -euo pipefail
+          git check-ref-format --branch "$BRANCH" >/dev/null || { echo "::error::not a branch name: $BRANCH"; exit 2; }
+          [ "$BRANCH" != dev ] || { echo "::error::pick the branch to deploy, not dev"; exit 2; }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+          token: ${{ secrets.DEV_SYNC_TOKEN || github.token }}
+
+      - name: Merge the branch into dev and push
+        env:
+          GH_TOKEN: ${{ secrets.DEV_SYNC_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rev-parse --verify -q "origin/$BRANCH" >/dev/null || { echo "::error::$BRANCH does not exist on $REPO"; exit 2; }
+
+          before=$(git rev-parse HEAD)
+          if ! git merge --no-ff --no-edit -m "Deploy $BRANCH to dev (by $ACTOR)" "origin/$BRANCH"; then
+            echo "::error::$BRANCH conflicts with dev in: $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" = "$before" ]; then
+            echo "dev already has every commit on $BRANCH, nothing to deploy"
+            echo "### dev already has \`$BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if out=$(git push origin HEAD:dev 2>&1); then
+            echo "$out"
+            {
+              echo "### Deployed \`$BRANCH\` to dev"
+              echo "dev was \`${before::12}\`, now \`$(git rev-parse --short=12 HEAD)\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif grep -qE 'GH013|GH006|protected branch' <<<"$out"; then
+            # A branch rule on dev wants a reviewed PR. Open one with the merge already done.
+            echo "$out"
+            head="deploy-dev/${BRANCH//\//-}-$GITHUB_RUN_ID"
+            git push origin "HEAD:refs/heads/$head"
+            url=$(gh pr create -R "$REPO" --base dev --head "$head" \
+                  --title "Deploy $BRANCH to dev" \
+                  --body "A rule on dev blocks a direct push. Approve and merge this PR to deploy \`$BRANCH\` to dev.")
+            echo "::notice::dev needs a reviewed PR in this repo: $url"
+            echo "### Deploy \`$BRANCH\` to dev needs a review: $url" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "$out"
+            echo "::error::could not push dev"
+            exit 1
+          fi
+
+          [ "$HAS_SYNC_TOKEN" = true ] \
+            || echo "::warning::pushed with GITHUB_TOKEN, so push-triggered workflows on dev (Lambda deploys, migrations) do not run. Set DEV_SYNC_TOKEN."
