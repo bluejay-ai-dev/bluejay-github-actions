@@ -1,0 +1,21 @@
+bin/nightly-page.py
+  s_dac4f23bfe61c8::t_f9ebb1059ef2e6 1-53,56-90
+bin/NIGHTLY_FIXTURES.md
+  s_dac4f23bfe61c8::t_b022c6b1f0a196 1-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "de49e285d7bae8662de083ff1dafd5b97d02580a",
+  "prompts": {},
+  "sessions": {
+    "s_dac4f23bfe61c8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62194cd3-37d2-4445-af4c-82081eb63780",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Lorenzo Taylor <lmtaylor9@dons.usfca.edu>"
+    }
+  }
+}
