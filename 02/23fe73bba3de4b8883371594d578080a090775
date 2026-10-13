@@ -1,0 +1,9 @@
+.github/workflows/preview-ticket.yml
+  ai_agent 141-143,146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0223fe73bba3de4b8883371594d578080a090775",
+  "prompts": {}
+}
