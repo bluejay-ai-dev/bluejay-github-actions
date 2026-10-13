@@ -23,6 +23,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # the preview's own lambdas and queues, via bluejay-preview-ci
 
 env:
   ORG: bluejay-ai-dev
@@ -109,6 +110,21 @@ jobs:
             > ~/.railway/config.json
           railway environment list >/dev/null
 
+      # this repo, not the caller's: bin/preview-lambdas.sh lives here
+      - uses: actions/checkout@v4
+        if: steps.t.outputs.skip != '1'
+        with:
+          repository: bluejay-ai-dev/bluejay-github-actions
+          ref: ${{ github.job_workflow_sha }}
+          path: .gating
+          token: ${{ secrets.PREVIEW_GH_TOKEN }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.t.outputs.skip != '1'
+        with:
+          role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
+          aws-region: us-west-1
+
       - name: Tear the ticket's preview down
         if: steps.t.outputs.skip != '1' && steps.t.outputs.want == '0'
         env:
@@ -129,6 +145,7 @@ jobs:
           [ -z "$id" ] || { curl -fsS -X DELETE --max-time 30 -H "Authorization: Bearer $mgmt" \
                  "https://api.supabase.com/v1/branches/$id" >/dev/null && echo "deleted db branch $ENV_NAME"; } \
             || echo "::warning::could not delete db branch $ENV_NAME"
+          .gating/bin/preview-lambdas.sh down "$ENV_NAME" || echo "::warning::could not remove $ENV_NAME's lambdas"
 
       - name: Build or refresh the ticket's preview
         id: up
@@ -211,6 +228,20 @@ jobs:
               || { echo "::error::$mwbr's migrations failed on the db branch"; exit 1; }
           fi
 
+          # The preview's own queue-fed lambdas, on the ticket's PR image where it has one
+          pr_fns=""
+          for pair in evals:evaluator text_agent:text_agent livekit_dispatcher:livekit_dispatcher; do
+            lr=${pair%%:*}; base=${pair##*:}
+            n=$(gh pr list -R "$ORG/$lr" --state open --search "$TICKET in:title" --limit 5 --json number -q 'first(.[].number) // ""') || n=""
+            [ -n "$n" ] && aws lambda get-function --function-name "pr${n}_$base" >/dev/null 2>&1 || continue
+            kind=$base; [ "$base" = livekit_dispatcher ] && kind=dispatcher
+            pr_fns="$pr_fns $kind:pr${n}_$base"; echo "$lr: pr${n}_$base"
+          done
+          PR_FUNCTIONS="$pr_fns" .gating/bin/preview-lambdas.sh up "$ENV_NAME" \
+            "postgres://postgres.$bref:$pw@$PREVIEW_PG_HOST:5432/postgres" "https://$bref.supabase.co" "$svckey" \
+            "https://middleware-$ENV_NAME.up.railway.app" >/dev/null \
+            || { echo "::error::could not build $ENV_NAME's lambdas"; exit 1; }
+
           # Swap the base project's ref, password and keys for the branch's in every
           # variable that carries them; everything else is inherited from preview-base.
           base_pw=$(railway variables -s middleware -e "$BASE_ENV" --json \
@@ -225,8 +256,11 @@ jobs:
             done < <(railway variables -s "$svc" -e "$BASE_ENV" --json | jq -r \
                        --arg r "$PREVIEW_DB_REF" --arg br "$bref" --arg p "$base_pw" --arg bp "$pw" \
                        --arg a "$base_anon" --arg ba "$anon" --arg s "$base_svc" --arg bs "$svckey" \
-                       'to_entries[] | select(.key|startswith("RAILWAY_")|not) | select(.value|tostring|(contains($r) or contains($a) or contains($s)))
-                        | [.key, (.value|split($r)|join($br)|split($p)|join($bp)|split($a)|join($ba)|split($s)|join($bs))] | @tsv')
+                       --arg e "$ENV_NAME-" \
+                       'to_entries[] | select(.key|startswith("RAILWAY_")|not)
+                        | select(.value|tostring|(contains($r) or contains($a) or contains($s) or contains("preview-base-")))
+                        | [.key, (.value|split($r)|join($br)|split($p)|join($bp)|split($a)|join($ba)|split($s)|join($bs)
+                                  |split("preview-base-")|join($e))] | @tsv')
           done
 
           # Recreate rather than patch: one command sets every branch atomically, and a
@@ -252,15 +286,6 @@ jobs:
           [ "$created" = 1 ] \
             || { echo "::error::could not create $ENV_NAME: $(tail -2 <<<"$err")"; exit 1; }
 
-          # Lambdas are deployed per PR by preview-lambda.yml; point this environment at them.
-          for pair in evals:LAMBDA_FUNCTION_NAME:evaluator text_agent:TEXT_AGENT_LAMBDA_FUNCTION_NAME:text_agent; do
-            lr=${pair%%:*}; rest=${pair#*:}; key=${rest%%:*}; base=${rest##*:}
-            n=$(gh pr list -R "$ORG/$lr" --state open --search "$TICKET in:title" --limit 5 --json number -q 'first(.[].number) // ""') || n=""
-            [ -n "$n" ] || continue
-            railway variable set --service middleware --environment "$ENV_NAME" --project "$PROJECT" \
-              --skip-deploys "$key=pr${n}_$base" >/dev/null 2>&1 \
-              && echo "$lr: pr${n}_$base" || echo "::warning::could not point $key at pr${n}_$base"
-          done
 
           # a duplicated environment gets its domain a beat after it exists, and reading
           # in that gap returns nothing, which silently costs the PR its comment.
