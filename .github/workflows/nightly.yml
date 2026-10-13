@@ -10,15 +10,14 @@
 name: nightly
 
 on:
-  # Schedule is off until the fixture org exists. Without TEST_SUITE_* the run dies at
-  # preflight, and a workflow that goes red every morning teaches people to ignore red.
-  # Uncomment when the fixtures are in. Manual dispatch works meanwhile.
-  # schedule:
-  #   - cron: '0 9 * * *'   # 09:00 UTC, so 01:00 PST / 02:00 PDT
+  # Missing fixtures end the run as verdict "fixture", which never pages. bin/NIGHTLY_FIXTURES.md
+  # lists what has to exist.
+  schedule:
+    - cron: '0 9 * * *'   # 09:00 UTC, so 01:00 PST / 02:00 PDT
   workflow_dispatch:
     inputs:
       parts:
-        description: 'Parts to run (blank = the full run)'
+        description: 'Parts to run (blank = the full run; a provider call is call:<name>)'
         required: false
         default: ''
 
@@ -29,7 +28,8 @@ concurrency:
 jobs:
   suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # One call per provider at up to ~5 min each, plus an amber retry.
+    timeout-minutes: 75
     outputs:
       verdict: ${{ steps.run.outputs.verdict }}
       summary: ${{ steps.run.outputs.summary }}
@@ -77,18 +77,32 @@ jobs:
           TEST_SUITE_AGENT_INBOUND: ${{ vars.NIGHTLY_AGENT_INBOUND }}
           TEST_SUITE_AGENT_ID: ${{ vars.NIGHTLY_AGENT_ID }}
           TEST_SUITE_ECHO_URL: ${{ vars.NIGHTLY_ECHO_URL }}
+          TEST_SUITE_SIM_WEBCHAT: ${{ vars.NIGHTLY_SIM_WEBCHAT }}
+          TEST_SUITE_PROVIDERS: ${{ vars.NIGHTLY_PROVIDERS }}
+          SUITE_NIGHTLY: '1'
+          PARTS: ${{ inputs.parts }}
         run: |
           set +e
-          if [ -n "${{ inputs.parts }}" ]; then
-            for p in ${{ inputs.parts }}; do ./suite.sh "$p"; done 2>&1 | tee /tmp/out
+          if [ -n "$PARTS" ]; then
+            rc=0 failed=''
+            for p in $PARTS; do
+              case $p in call:*) ./suite.sh call "${p#call:}" ;; *) ./suite.sh "$p" ;; esac
+              r=$?
+              [ $r = 1 ] && failed+=" $p"
+              [ $r != 0 ] && { [ $rc = 0 ] || [ $r = 1 ]; } && rc=$r
+            done > /tmp/out 2>&1
+            cat /tmp/out
+            # A manual run prints no closing line, so write the one the pager reads.
+            [ $rc = 1 ] && echo "FAIL:$failed in 0s" >> /tmp/out
           else
             ./suite.sh run 2>&1 | tee /tmp/out
+            rc=${PIPESTATUS[0]}
           fi
-          rc=${PIPESTATUS[0]}
           case $rc in
             0) v=green ;;
             3) v=fixture ;;   # our own test data rotted; not a product failure
             4) v=config ;;    # a provider's credentials are red
+            5) v=amber ;;     # a carrier dropped or did not answer, twice; reported, never paged
             *) v=red ;;
           esac
           echo "verdict=$v" >> "$GITHUB_OUTPUT"
@@ -97,8 +111,20 @@ jobs:
             grep -E '^(ok|FAIL|MISS|AMBER)' /tmp/out | head -20
             echo EOF
           } >> "$GITHUB_OUTPUT"
-          echo "### nightly: $v" >> "$GITHUB_STEP_SUMMARY"
-          sed -n '1,60p' /tmp/out >> "$GITHUB_STEP_SUMMARY"
+          case $v in
+            green)   why='every part passed' ;;
+            red)     why='a part failed, PagerDuty was paged' ;;
+            amber)   why='a call was dropped or not answered twice; carrier noise, not paged, look if it repeats' ;;
+            fixture) why='our own prod fixtures are missing or broken (see MISS lines and bin/NIGHTLY_FIXTURES.md); not paged' ;;
+            config)  why='a provider credential check is red, so the calls were skipped; not paged' ;;
+          esac
+          {
+            echo "### nightly: $v"
+            echo "$why"
+            echo '```'
+            grep -E '^(ok|FAIL|MISS|AMBER|PASS)' /tmp/out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           exit $rc
 
       - name: Keep the evidence
@@ -112,7 +138,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-# No Slack job on purpose. Prod issues already page through their own path, so a second
-# "the nightly is red" message is a channel people learn to mute. The verdict is on the
-# run, the evidence is in the artifact, and a person who broke their own batch is DM'd by
-# notify.sh rather than told in a channel.
+      # Red triggers one PagerDuty incident (fixed dedup key), green resolves it. Amber,
+      # fixture and config only show in the run summary above.
+      - name: Page on red, resolve on green
+        if: always() && (steps.run.outputs.verdict == 'red' || steps.run.outputs.verdict == 'green')
+        env:
+          VERDICT: ${{ steps.run.outputs.verdict }}
+          ROUTING_KEY: ${{ secrets.NIGHTLY_PAGERDUTY_ROUTING_KEY }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 bin/nightly-page.py /tmp/out
+
+# No Slack job on purpose: PagerDuty is the one place a red nightly goes. A person who
+# broke their own batch is DM'd by notify.sh rather than told in a channel.
