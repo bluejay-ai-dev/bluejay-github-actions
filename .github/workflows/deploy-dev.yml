@@ -1,13 +1,15 @@
 name: deploy-dev
 
-# Merges a branch into the caller's `dev` and pushes it, so that repo's existing
+# Points the caller's `dev` at a branch, history and all, so that repo's existing
 # push-to-dev deploys run: the Railway dev services, the dev Lambdas, dev migrations.
 #
-# Merge, never reset. `dev` holds commits main does not have, and a reset deletes them.
+# A force push, never a merge. dev is a copy of whatever was deployed last, so it never
+# drifts from main by more than that branch does. Commits only on dev are dropped; the
+# summary keeps the old sha so they can be restored.
 #
 # DEV_SYNC_TOKEN is required. GITHUB_TOKEN cannot push a change under .github/workflows,
 # and its pushes start no other workflow, so the Lambda deploys on dev would never run.
-# It needs Contents, Workflows and Pull requests write on the caller repo.
+# It needs Contents and Workflows write on the caller repo.
 
 on:
   workflow_call:
@@ -36,64 +38,33 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          ref: dev
           fetch-depth: 0
           token: ${{ secrets.DEV_SYNC_TOKEN }}
 
-      - name: Merge the branch into dev and push
+      - name: Point dev at the branch
         env:
-          GH_TOKEN: ${{ secrets.DEV_SYNC_TOKEN }}
           REPO: ${{ github.repository }}
-          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rev-parse --verify -q "origin/$BRANCH" >/dev/null || { echo "::error::$BRANCH does not exist on $REPO"; exit 2; }
+          sha=$(git rev-parse --verify -q "origin/$BRANCH^{commit}") || { echo "::error::$BRANCH does not exist on $REPO"; exit 2; }
+          before=$(git rev-parse --verify -q origin/dev || echo none)
+          if [ "$before" = "$sha" ]; then
+            echo "dev is already at $BRANCH, nothing to deploy"
+            echo "### dev is already at \`$BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
-          # Another run or person can move dev between the fetch and the push. Merge again
-          # onto the new dev rather than fail.
-          for attempt in 1 2 3; do
-            git fetch -q origin "+refs/heads/dev:refs/remotes/origin/dev" "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
-            git reset -q --hard origin/dev
-            before=$(git rev-parse HEAD)
-            if ! git merge --no-ff --no-edit -m "Deploy $BRANCH to dev (by $ACTOR)" "origin/$BRANCH"; then
-              echo "::error::$BRANCH conflicts with dev in: $(git diff --name-only --diff-filter=U | tr '\n' ' ')"
-              exit 1
-            fi
-            if [ "$(git rev-parse HEAD)" = "$before" ]; then
-              echo "dev already has every commit on $BRANCH, nothing to deploy"
-              echo "### dev already has \`$BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-
-            if out=$(git push origin HEAD:dev 2>&1); then
-              echo "$out"
-              {
-                echo "### Deployed \`$BRANCH\` to dev"
-                echo "dev was \`${before::12}\`, now \`$(git rev-parse --short=12 HEAD)\`."
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
+          if ! out=$(git push --force origin "$sha:refs/heads/dev" 2>&1); then
             echo "$out"
-
             if grep -qE 'GH013|GH006|protected branch' <<<"$out"; then
-              # A branch rule on dev wants a reviewed PR. Open one with the merge already done.
-              head="deploy-dev/${BRANCH//\//-}-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-              git push -q origin "HEAD:refs/heads/$head"
-              if ! url=$(gh pr create -R "$REPO" --base dev --head "$head" \
-                    --title "Deploy $BRANCH to dev" \
-                    --body "A rule on dev blocks a direct push. Approve and merge this PR to deploy \`$BRANCH\` to dev."); then
-                git push -q origin --delete "$head" || true
-                echo "::error::dev needs a reviewed PR here, and the PR could not be opened"
-                exit 1
-              fi
-              echo "::notice::dev needs a reviewed PR in this repo: $url"
-              echo "### Deploy \`$BRANCH\` to dev needs a review: $url" >> "$GITHUB_STEP_SUMMARY"
-              exit 0
+              echo "::error::a branch rule on dev blocks force pushes. Allow them for DEV_SYNC_TOKEN's owner."
+            else
+              echo "::error::could not push dev"
             fi
-            grep -qE 'fetch first|non-fast-forward' <<<"$out" || { echo "::error::could not push dev"; exit 1; }
-            echo "dev moved during the run, merging again (attempt $attempt)"
-          done
-          echo "::error::dev kept moving, try again"
-          exit 1
+            exit 1
+          fi
+          echo "$out"
+          {
+            echo "### Deployed \`$BRANCH\` to dev"
+            echo "dev was \`$before\`, now \`$sha\`. To restore it, push the old sha to dev."
+          } >> "$GITHUB_STEP_SUMMARY"
