@@ -138,15 +138,14 @@ jobs:
             br=$(gh pr list -R "$ORG/$r" --state open --search "$TICKET in:title" --limit 10 \
                  --json number,title,headRefName \
                  -q "first(.[] | select((.title | test(\"(^|[^A-Za-z0-9])$TICKET([^0-9]|\$)\";\"i\")) and ((.headRefName + .title) | contains(\"--np\") | not)) | .headRefName) // \"\"")
-            # preview-base is the permanent environment and runs every worker on main. A
-            # preview shares its data, so only the services the ticket changed run there;
-            # the rest idle (workers read PREVIEW_IDLE, everything else ignores it).
+            # Workers idle in preview-base and in every preview except the ones the ticket
+            # changed, so shared data never gets two schedulers (workers read PREVIEW_IDLE).
+            # A lambda-only ticket touches none of these and still gets an environment.
             [ -n "$br" ] || { echo "$r: main (untouched)"; args+=(--service-config "$svc" variables.PREVIEW_IDLE.value 1); continue; }
             echo "$r: $br"
-            args+=(--service-config "$svc" source.branch "$br")
+            args+=(--service-config "$svc" source.branch "$br" --service-config "$svc" variables.PREVIEW_IDLE.value 0)
             touched="$touched $r"
           done
-          [ -n "$touched" ] || { echo "::error::$TICKET has no open PR in a Railway-backed repo"; exit 1; }
 
           # Recreate rather than patch: one command sets every branch atomically, and a
           # preview is disposable so there is nothing worth preserving across a refresh.
