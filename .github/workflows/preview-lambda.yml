@@ -20,6 +20,7 @@ on:
     secrets:
       RAILWAY_TOKEN:    { required: true }
       PREVIEW_GH_TOKEN: { required: true }
+      LINEAR_API_KEY:   { required: false }
     outputs:
       function:
         description: 'The PR lambda, empty when torn down or not applicable'
@@ -236,3 +237,16 @@ jobs:
           else
             echo "function=$FN" >> "$GITHUB_OUTPUT"
           fi
+
+  # A lambda-only ticket has no Railway PR to create its environment or post its link.
+  ticket:
+    needs: deploy
+    uses: bluejay-ai-dev/bluejay-github-actions/.github/workflows/preview-ticket.yml@main
+    with:
+      repo: ${{ inputs.repo }}
+      pr: ${{ inputs.pr }}
+      action: ${{ inputs.action }}
+    secrets:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      PREVIEW_GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+      LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}

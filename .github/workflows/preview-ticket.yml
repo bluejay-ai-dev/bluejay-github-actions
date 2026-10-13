@@ -29,6 +29,8 @@ env:
   PROJECT: 7047af18-477f-42e0-a905-f2e8f7ccac0f
   BASE_ENV: preview-base
   BASE_ENV_ID: 0a1b75a1-8402-418a-8192-00fe1613ec14
+  # not Railway services, but a PR in one still wants the ticket's preview and its link
+  LAMBDA_REPOS: evals:x text_agent:x emails-lambda:x livekit_dispatcher:x
   # preview-base is the permanent environment: every registered service on main, always
   # on. Its service list is the registry, read at run time, so adding a service there
   # (plus the repo's preview.yml caller) is the whole setup. Lambdas are preview-lambda.yml.
@@ -74,7 +76,7 @@ jobs:
           # --np opts a single PR out. It does not veto the ticket: a docs-only PR beside a
           # real one should not cost the rest of the ticket its environment.
           want=0
-          for entry in $RAILWAY_REPOS; do
+          for entry in $RAILWAY_REPOS $LAMBDA_REPOS; do
             r=${entry%%:*}
             while IFS=$'\t' read -r n base head title; do
               [ -n "${n:-}" ] || continue
@@ -227,7 +229,7 @@ jobs:
           body="$body"$'\n'"It is rebuilt on every push and torn down when the ticket's last PR closes."
 
           # One comment per PR, replacing our own previous one so pushes do not pile up.
-          for entry in $RAILWAY_REPOS evals:x text_agent:x livekit_dispatcher:x; do
+          for entry in $RAILWAY_REPOS $LAMBDA_REPOS; do
             r=${entry%%:*}
             for n in $(gh pr list -R "$ORG/$r" --state open --search "$TICKET in:title" --limit 10 --json number -q '.[].number'); do
               old=$(gh api "repos/$ORG/$r/issues/$n/comments" \
