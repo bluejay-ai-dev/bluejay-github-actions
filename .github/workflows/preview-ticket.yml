@@ -29,6 +29,10 @@ env:
   PROJECT: 7047af18-477f-42e0-a905-f2e8f7ccac0f
   BASE_ENV: preview-base
   BASE_ENV_ID: 0a1b75a1-8402-418a-8192-00fe1613ec14
+  # bluejay-previews: main's schema plus a slice of prod. Each ticket gets a branch of it
+  # with that data, so previews never share a database or its connection slots.
+  PREVIEW_DB_REF: kegttrzkpbpjzrrfxmpj
+  PREVIEW_PG_HOST: aws-1-ca-central-1.pooler.supabase.com
   # not Railway services, but a PR in one still wants the ticket's preview and its link
   LAMBDA_REPOS: evals:x text_agent:x emails-lambda:x livekit_dispatcher:x
   # preview-base is the permanent environment: every registered service on main, always
@@ -118,6 +122,13 @@ jobs:
           else
             echo "$ENV_NAME does not exist, nothing to tear down"
           fi
+          mgmt=$(railway variables -s frontend -e "$BASE_ENV" --json | jq -r '.SUPABASE_MANAGEMENT_API_TOKEN // empty')
+          echo "::add-mask::$mgmt"
+          id=$(curl -fsS --max-time 30 -H "Authorization: Bearer $mgmt" \
+                 "https://api.supabase.com/v1/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" 2>/dev/null | jq -r '.id // empty')
+          [ -z "$id" ] || { curl -fsS -X DELETE --max-time 30 -H "Authorization: Bearer $mgmt" \
+                 "https://api.supabase.com/v1/branches/$id" >/dev/null && echo "deleted db branch $ENV_NAME"; } \
+            || echo "::warning::could not delete db branch $ENV_NAME"
 
       - name: Build or refresh the ticket's preview
         id: up
@@ -145,6 +156,71 @@ jobs:
             echo "$r: $br"
             args+=(--service-config "$svc" source.branch "$br" --service-config "$svc" variables.PREVIEW_IDLE.value 0)
             touched="$touched $r"
+          done
+
+          # The ticket's own database: a branch of bluejay-previews, reused across refreshes
+          # so its data survives a push. Its credentials go into the duplicate's variables
+          # below, in the same atomic create, so no service ever starts on the base data.
+          mgmt=$(railway variables -s frontend -e "$BASE_ENV" --json | jq -r '.SUPABASE_MANAGEMENT_API_TOKEN // empty')
+          [ -n "$mgmt" ] || { echo "::error::no SUPABASE_MANAGEMENT_API_TOKEN on $BASE_ENV frontend"; exit 1; }
+          echo "::add-mask::$mgmt"
+          sb() { curl -fsS --max-time 60 -H "Authorization: Bearer $mgmt" -H 'content-type: application/json' "$@"; }
+          api=https://api.supabase.com/v1
+          bref=$(sb "$api/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" 2>/dev/null | jq -r '.project_ref // empty') || bref=""
+          if [ -z "$bref" ]; then
+            bref=$(sb -X POST "$api/projects/$PREVIEW_DB_REF/branches" \
+                     -d "$(jq -nc --arg n "$ENV_NAME" '{branch_name:$n, with_data:true}')" | jq -r '.project_ref // empty')
+            [ -n "$bref" ] || { echo "::error::could not create db branch $ENV_NAME"; exit 1; }
+            echo "created db branch $ENV_NAME ($bref)"
+          fi
+          for _ in $(seq 1 60); do
+            st=$(sb "$api/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" | jq -r .status) || st=""
+            case "$st" in ACTIVE_HEALTHY|FUNCTIONS_DEPLOYED) break ;; *FAILED*) echo "::error::db branch $st"; exit 1 ;; esac
+            sleep 10
+          done
+          pw=$(openssl rand -hex 24); echo "::add-mask::$pw"
+          sb -X PATCH "$api/projects/$bref/database/password" -d "$(jq -nc --arg p "$pw" '{password:$p}')" >/dev/null \
+            || { echo "::error::could not set the db branch password"; exit 1; }
+          keys=$(sb "$api/projects/$bref/api-keys?reveal=true")
+          anon=$(jq -r '.[]|select(.name=="anon").api_key' <<<"$keys"); svckey=$(jq -r '.[]|select(.name=="service_role").api_key' <<<"$keys")
+          echo "::add-mask::$anon"; echo "::add-mask::$svckey"
+          # sign-in on the branch: the base project's auth settings, this preview's frontend as the site
+          sb "$api/projects/$PREVIEW_DB_REF/config/auth" \
+            | jq -c --arg site "https://frontend-$ENV_NAME.up.railway.app" \
+                'with_entries(select(.key|test("^(external_google_|external_email_enabled|mailer_|jwt_exp|uri_allow_list)"))
+                 | select(.value!=null)) + {site_url:$site}' \
+            | sb -X PATCH "$api/projects/$bref/config/auth" -d @- >/dev/null \
+            || echo "::warning::could not copy auth settings to the db branch"
+
+          # the ticket's own migrations, when it has a middleware PR
+          mwbr=$(gh pr list -R "$ORG/bluejay_middleware" --state open --search "$TICKET in:title" --limit 5 \
+                   --json headRefName,baseRefName -q 'first(.[]|select(.baseRefName=="main").headRefName) // ""') || mwbr=""
+          if [ -n "$mwbr" ]; then
+            git clone -q --depth 1 --branch "$mwbr" "https://x-access-token:$GH_TOKEN@github.com/$ORG/bluejay_middleware.git" /tmp/mw
+            curl -fsSL -o /tmp/dbmate https://github.com/amacneil/dbmate/releases/download/v2.33.0/dbmate-linux-amd64
+            echo "dfd4027141b6e4357158099bdfe6c02b286af70f8e49057937744cf80b38ea1c  /tmp/dbmate" | sha256sum -c - >/dev/null
+            chmod +x /tmp/dbmate
+            DATABASE_URL="postgres://postgres.$bref:$pw@$PREVIEW_PG_HOST:5432/postgres?sslmode=require" \
+              /tmp/dbmate -d /tmp/mw/db/migrations --no-dump-schema up \
+              || { echo "::error::$mwbr's migrations failed on the db branch"; exit 1; }
+          fi
+
+          # Swap the base project's ref, password and keys for the branch's in every
+          # variable that carries them; everything else is inherited from preview-base.
+          base_pw=$(railway variables -s middleware -e "$BASE_ENV" --json \
+                      | jq -r '.DATABASE_URL' | python3 -c 'import sys,urllib.parse as u;print(u.urlparse(sys.stdin.read().strip()).password)')
+          base_keys=$(sb "$api/projects/$PREVIEW_DB_REF/api-keys?reveal=true")
+          base_anon=$(jq -r '.[]|select(.name=="anon").api_key' <<<"$base_keys"); base_svc=$(jq -r '.[]|select(.name=="service_role").api_key' <<<"$base_keys")
+          echo "::add-mask::$base_pw"; echo "::add-mask::$base_anon"; echo "::add-mask::$base_svc"
+          for entry in $RAILWAY_REPOS; do
+            svc=${entry##*:}
+            while IFS=$'\t' read -r k v; do
+              args+=(--service-config "$svc" "variables.$k.value" "$v")
+            done < <(railway variables -s "$svc" -e "$BASE_ENV" --json | jq -r \
+                       --arg r "$PREVIEW_DB_REF" --arg br "$bref" --arg p "$base_pw" --arg bp "$pw" \
+                       --arg a "$base_anon" --arg ba "$anon" --arg s "$base_svc" --arg bs "$svckey" \
+                       'to_entries[] | select(.key|startswith("RAILWAY_")|not) | select(.value|tostring|(contains($r) or contains($a) or contains($s)))
+                        | [.key, (.value|split($r)|join($br)|split($p)|join($bp)|split($a)|join($ba)|split($s)|join($bs))] | @tsv')
           done
 
           # Recreate rather than patch: one command sets every branch atomically, and a
