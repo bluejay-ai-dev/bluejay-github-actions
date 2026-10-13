@@ -57,6 +57,7 @@ verdict() {
   case "$1" in
     COMPLETED|CONVERSATION_ENDED|RUNNING|EVALUATING) echo green ;;
     NO_ANSWER|CALL_DROPPED)                         echo amber ;;
+    INITIALIZING|QUEUED|READY|DISPATCHED)           echo pending ;;
     *)                                              echo red ;;
   esac
 }
@@ -74,11 +75,13 @@ result_of() {
 # dispatch, so a 200 from the queue endpoint means nothing and a stuck dispatch has to
 # fail in 45s rather than burn the whole 300.
 await() {  # await <result_id> <wanted...|deadline> ; echoes the status it settled on
-  local id=$1 want=$2 deadline=$3 end=$((SECONDS + deadline)) s
+  # Two locals on purpose: bash expands a local's arguments before assigning any of them.
+  local id=$1 want=$2 deadline=$3 s
+  local end=$((SECONDS + deadline))
   while [ $SECONDS -lt "$end" ]; do
     s=$(result_of "$id")
     grep -qw -- "$s" <<<"$want" && { echo "$s"; return; }
-    [ "$(verdict "$s")" = green ] || { echo "$s"; return; }
+    case $(verdict "$s") in green|pending) ;; *) echo "$s"; return ;; esac
     sleep 5
   done
   echo "STUCK_IN_${s:-UNKNOWN}"
@@ -233,9 +236,12 @@ http_text() {
   evals=$(body | jq '.simulation_result.metrics | length // 0')
   url=$(body | jq -r '.simulation_result.transcript_url // empty')
   [ "${evals:-0}" -gt 0 ] || { bad "$part" "COMPLETED with no metric results: evals or the ClickHouse write is broken"; return $E_FAIL; }
-  [ -n "$url" ] || { bad "$part" "COMPLETED with no transcript_url"; return $E_FAIL; }
-
-  curl -s --max-time 30 "$url" -o /tmp/suite.tx || { bad "$part" "transcript_url unfetchable"; return $E_FAIL; }
+  # The API inlines the transcript when it has one and only signs a URL when it does not.
+  body | jq '.simulation_result.transcript // []' > /tmp/suite.tx
+  if ! jq -e 'length > 0' /tmp/suite.tx >/dev/null 2>&1; then
+    [ -n "$url" ] || { bad "$part" "COMPLETED with no transcript"; return $E_FAIL; }
+    curl -s --max-time 30 "$url" -o /tmp/suite.tx || { bad "$part" "transcript_url unfetchable"; return $E_FAIL; }
+  fi
   turns=$(jq '[.. | objects | select(has("speaker") or has("role"))] | length' /tmp/suite.tx 2>/dev/null)
   [ "${turns:-0}" -ge 4 ] || { bad "$part" "only $turns turns, expected >= 4"; return $E_FAIL; }
 
@@ -269,11 +275,14 @@ cmd_sms() {
 
   call GET "/v1/retrieve-simulation-result/$rid" >/dev/null
   local url; url=$(body | jq -r '.simulation_result.transcript_url // empty')
-  [ -n "$url" ] || { bad sms "$s with no transcript_url"; return $E_FAIL; }
-  curl -s --max-time 30 "$url" -o /tmp/suite.sms || { bad sms "transcript_url unfetchable"; return $E_FAIL; }
+  body | jq '.simulation_result.transcript // []' > /tmp/suite.sms
+  if ! jq -e 'length > 0' /tmp/suite.sms >/dev/null 2>&1; then
+    [ -n "$url" ] || { bad sms "$s with no transcript"; return $E_FAIL; }
+    curl -s --max-time 30 "$url" -o /tmp/suite.sms || { bad sms "transcript_url unfetchable"; return $E_FAIL; }
+  fi
   local inb outb
   inb=$(jq '[.. | objects | select((.speaker // .role // "") | test("agent|assistant";"i"))] | length' /tmp/suite.sms 2>/dev/null)
-  outb=$(jq '[.. | objects | select((.speaker // .role // "") | test("human|user|digital";"i"))] | length' /tmp/suite.sms 2>/dev/null)
+  outb=$(jq '[.. | objects | select((.speaker // .role // "") | test("human|user|digital|bluejay";"i"))] | length' /tmp/suite.sms 2>/dev/null)
   [ "${inb:-0}" -ge 2 ] && [ "${outb:-0}" -ge 2 ] || { bad sms "$inb in / $outb out, expected >= 2 each"; return $E_FAIL; }
   ok sms "$s, $inb in / $outb out"
 }
@@ -477,10 +486,11 @@ attempt() {
 
 cmd_run() {
   FE=${1:-$FE}; API=${2:-$API}
-  [ -n "$FE" ] || { echo "usage: suite.sh run <frontend_url> [api_url]" >&2; exit $E_USAGE; }
+  # The daily passes the URL as a repo variable; unset is a missing fixture, not a red.
+  [ -n "$FE" ] || miss run "SUITE_FRONTEND_URL is unset (usage: suite.sh run <frontend_url> [api_url])"
   FE=${FE%/}; API=${API%/}
   export SUITE_FRONTEND_URL=$FE SUITE_API_URL=$API
-  local t0=$SECONDS rc=0 failed=() ambered=()
+  local t0=$SECONDS rc=0 config='' failed=() ambered=() missed=()
 
   cmd_preflight || exit $?
   local skip=" " prc calls
@@ -496,30 +506,34 @@ cmd_run() {
     prc=$?
     case $prc in
       0) ;;
-      "$E_FIXTURE") exit $E_FIXTURE ;;
-      "$E_AMBER") ambered+=("$part"); [ $rc = 0 ] && rc=$E_AMBER ;;
+      # Keep going: a fixture gone mid-run must not hide a part that already failed.
+      "$E_FIXTURE") missed+=("$part") ;;
+      "$E_AMBER") ambered+=("$part") ;;
       # A provider whose credentials are red is a config problem, not a regression, and the
       # call tests would only fail for the same reason. Report config, do not report a
       # regression that is not there.
-      "$E_CONFIG") rc=$E_CONFIG
+      "$E_CONFIG") config=1
                    # Only the credential check implies the call tests would fail too.
                    # A chat route with no MCP URLs says nothing about telephony.
                    [ "$part" = creds ] && { note "provider config red, skipping the call tests"
                                             skip+="outbound inbound $calls"; } ;;
-      *) failed+=("$part"); rc=$E_FAIL
+      *) failed+=("$part")
          # The browser walk reads the run the text part creates; without one it has nothing
          # to assert and would only re-report the same failure.
          [ "$part" = text ] && skip+="browser " ;;
     esac
   done
 
-  touched 'red.?team' && { attempt cmd_redteam || { failed+=(redteam); rc=$E_FAIL; }; }
-  touched 'uptime'    && { attempt cmd_uptime  || { failed+=(uptime);  rc=$E_FAIL; }; }
+  touched 'red.?team' && { attempt cmd_redteam || failed+=(redteam); }
+  touched 'uptime'    && { attempt cmd_uptime  || failed+=(uptime); }
 
+  # Worst first: a regression outranks rotted fixtures, which outrank red credentials.
   local line=PASS
-  [ $rc = $E_AMBER ] && line="AMBER: ${ambered[*]}"
-  [ $rc = $E_CONFIG ] && line="FAIL: config"
-  [ $rc = $E_FAIL ] && line="FAIL: ${failed[*]}"
+  if [ ${#failed[@]} -gt 0 ]; then rc=$E_FAIL line="FAIL: ${failed[*]}"
+  elif [ ${#missed[@]} -gt 0 ]; then rc=$E_FIXTURE line="MISS: ${missed[*]}"
+  elif [ -n "$config" ]; then rc=$E_CONFIG line="FAIL: config"
+  elif [ ${#ambered[@]} -gt 0 ]; then rc=$E_AMBER line="AMBER: ${ambered[*]}"
+  fi
   printf '\n%s in %ss\n' "$line" $((SECONDS - t0))
   exit $rc
 }
@@ -537,6 +551,8 @@ cmd_selftest() {
   chk SYSTEM_ERROR       "$(verdict SYSTEM_ERROR)"       red
   chk OUT_OF_FUNDS       "$(verdict OUT_OF_FUNDS)"       red
   chk STUCK              "$(verdict STUCK_IN_QUEUED)"    red
+  chk QUEUED             "$(verdict QUEUED)"             pending
+  chk READY              "$(verdict READY)"              pending
 
   # amber retries exactly once, then hardens to a failure
   local n=0

@@ -10,7 +10,8 @@ when one is missing. All commands take `-R bluejay-ai-dev/bluejay-github-actions
    least one SMS and voice capable phone number. bluejayai refuses to run without a number.
 2. **Org B.** A second, separate prod org. Only its API key is used, to prove one org cannot
    read another's traces.
-3. **Fixture user.** A user that is a member of org A. Sign-in goes through a service-role
+3. **Fixture user.** A user that is a member of org A and no other org. A second
+   membership lands sign-in on the org picker, and browser and bluejayai end as `fixture`. Sign-in goes through a service-role
    magic link, so no password is needed. signup.mjs makes and deletes its own throwaway
    account at `gate+signup-*@bluejaysims.com` each run.
 4. **Text agent and sim.** A TEXT agent with `http_webhook` set to the hosted echo, plus a
