@@ -21,10 +21,14 @@ EXERCISES = {
 }
 
 out = open(sys.argv[1]).read() if len(sys.argv) > 1 and os.path.exists(sys.argv[1]) else ""
-run_url, verdict = os.environ["RUN_URL"], os.environ["VERDICT"]
+# an empty verdict means the suite step crashed or timed out before reporting, which pages
+run_url, verdict = os.environ["RUN_URL"], os.environ["VERDICT"] or "red"
 key = os.environ.get("ROUTING_KEY", "")
 if not key:
-    sys.exit("NIGHTLY_PAGERDUTY_ROUTING_KEY is unset, nobody was paged")
+    if verdict == "red":
+        sys.exit("NIGHTLY_PAGERDUTY_ROUTING_KEY is unset, nobody was paged")
+    print("NIGHTLY_PAGERDUTY_ROUTING_KEY is unset, nothing to resolve")
+    sys.exit(0)
 
 m = re.search(r"^FAIL: (.*) in \d+s$", out, re.M)
 failed = m.group(1).split() if m else []

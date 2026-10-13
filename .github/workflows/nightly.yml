@@ -141,7 +141,7 @@ jobs:
       # Red triggers one PagerDuty incident (fixed dedup key), green resolves it. Amber,
       # fixture and config only show in the run summary above.
       - name: Page on red, resolve on green
-        if: always() && (steps.run.outputs.verdict == 'red' || steps.run.outputs.verdict == 'green')
+        if: always() && contains(fromJSON('["red", "green", ""]'), steps.run.outputs.verdict)
         env:
           VERDICT: ${{ steps.run.outputs.verdict }}
           ROUTING_KEY: ${{ secrets.NIGHTLY_PAGERDUTY_ROUTING_KEY }}
