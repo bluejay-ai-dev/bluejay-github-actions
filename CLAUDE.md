@@ -72,6 +72,18 @@ The search side has to span every state.
 throws when unset even though `generate` never connects, which killed `codegen` with a bare
 exit 2 and no message, and killed `build` inside `npm ci`'s postinstall.
 
+## Adding a service to previews
+
+1. Create the service in Railway's `preview-base` environment, on the repo's `main`.
+2. Copy `preview.yml` from any caller (vapi_agent's is the template) into the repo's
+   `.github/workflows/`. The repo needs `RAILWAY_TOKEN`, `PREVIEW_GH_TOKEN` and `LINEAR_API_KEY`.
+3. Run `bin/preview-add-service <name>` (add a row to its `SERVICES`, or pass `--project`,
+   `--from` and `--set`). It needs `infisical login`, `railway login` and the `preview` identity
+   in `PREVIEW_IDENTITY_ID`, `PREVIEW_IDENTITY_CLIENT_ID` and `PREVIEW_IDENTITY_CLIENT_SECRET`.
+   `--dry-run` writes nothing.
+
+`preview-cleanup.yml` sweeps nightly for previews whose ticket has no open PR to main.
+
 ## Exit codes, shared by suite.sh and enqueue.sh
 
 `0` pass, `1` regression, `2` usage, `3` fixtures or prereqs missing, `4` provider config
