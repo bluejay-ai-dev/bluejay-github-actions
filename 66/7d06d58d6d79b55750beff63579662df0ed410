@@ -1,0 +1,19 @@
+bin/suite.sh
+  s_4e97ed0a1560cb::t_a8a6571912e3f4 63,268,324
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "667d06d58d6d79b55750beff63579662df0ed410",
+  "prompts": {},
+  "sessions": {
+    "s_4e97ed0a1560cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7225979e-e088-48c7-898a-f64018e1d998",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Yash Savalia <yashsavalia1@gmail.com>"
+    }
+  }
+}
