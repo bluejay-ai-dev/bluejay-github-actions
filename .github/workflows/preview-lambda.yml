@@ -37,6 +37,7 @@ jobs:
     timeout-minutes: 25
     outputs:
       function: ${{ steps.out.outputs.function }}
+      go: ${{ steps.gate.outputs.go }}
     steps:
       # Same gate as preview-ticket.yml: PRs to main only. Without it a lambda repo
       # would build and push an image on every PR, which is the half that costs money.
@@ -60,7 +61,7 @@ jobs:
           elif [ "$np" = np ]; then
             echo "marked --np, nothing to build"
             echo "go=0" >> "$GITHUB_OUTPUT"
-          elif [ "$base" = main ] || [ "$has" != no ]; then
+          elif [ "$base" = main ]; then
             echo "go=1" >> "$GITHUB_OUTPUT"
           else
             echo "not a PR to main, nothing to build"
@@ -196,6 +197,8 @@ jobs:
   # A lambda-only ticket has no Railway PR to create its environment or post its link.
   ticket:
     needs: deploy
+    # only PRs this gate serves, plus every close so teardown still runs
+    if: ${{ !cancelled() && (inputs.action == 'closed' || needs.deploy.outputs.go == '1') }}
     uses: bluejay-ai-dev/bluejay-github-actions/.github/workflows/preview-ticket.yml@main
     with:
       repo: ${{ inputs.repo }}

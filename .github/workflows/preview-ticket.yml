@@ -43,7 +43,12 @@ env:
 jobs:
   ticket:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # a fresh db branch alone can take 10 minutes to come up
+    timeout-minutes: 45
+    # pushes to one PR queue instead of racing on its ticket's db password and environment
+    concurrency:
+      group: preview-${{ inputs.repo }}-${{ inputs.pr }}
+      cancel-in-progress: false
     steps:
       - name: Resolve the ticket and whether it wants a preview
         id: t
@@ -187,8 +192,10 @@ jobs:
           api=https://api.supabase.com/v1
           bref=$(sb "$api/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" 2>/dev/null | jq -r '.project_ref // empty') || bref=""
           if [ -z "$bref" ]; then
+            # a sibling repo's run may create it first, so read it back before giving up
             bref=$(sb -X POST "$api/projects/$PREVIEW_DB_REF/branches" \
-                     -d "$(jq -nc --arg n "$ENV_NAME" '{branch_name:$n, with_data:true}')" | jq -r '.project_ref // empty')
+                     -d "$(jq -nc --arg n "$ENV_NAME" '{branch_name:$n, with_data:true}')" | jq -r '.project_ref // empty') \
+              || bref=$(sb "$api/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" | jq -r '.project_ref // empty') || bref=""
             [ -n "$bref" ] || { echo "::error::could not create db branch $ENV_NAME"; exit 1; }
             echo "created db branch $ENV_NAME ($bref)"
           fi
@@ -197,15 +204,18 @@ jobs:
             case "$st" in ACTIVE_HEALTHY|FUNCTIONS_DEPLOYED) break ;; *FAILED*) echo "::error::db branch $st"; exit 1 ;; esac
             sleep 10
           done
+          case "$st" in ACTIVE_HEALTHY|FUNCTIONS_DEPLOYED) ;; *) echo "::error::db branch still $st after 10 minutes"; exit 1 ;; esac
           pw=$(openssl rand -hex 24); echo "::add-mask::$pw"
           sb -X PATCH "$api/projects/$bref/database/password" -d "$(jq -nc --arg p "$pw" '{password:$p}')" >/dev/null \
             || { echo "::error::could not set the db branch password"; exit 1; }
           # the pooler takes ~20s to accept a new password
+          up=0
           for _ in $(seq 1 18); do
             PGPASSWORD="$pw" psql "host=$PREVIEW_PG_HOST port=5432 user=postgres.$bref dbname=postgres sslmode=require connect_timeout=10" \
-              -X -A -t -c 'select 1' >/dev/null 2>&1 && break
+              -X -A -t -c 'select 1' >/dev/null 2>&1 && { up=1; break; }
             sleep 10
           done
+          [ "$up" = 1 ] || { echo "::error::the pooler never accepted the db branch password"; exit 1; }
           keys=$(sb "$api/projects/$bref/api-keys?reveal=true")
           anon=$(jq -r '.[]|select(.name=="anon").api_key' <<<"$keys"); svckey=$(jq -r '.[]|select(.name=="service_role").api_key' <<<"$keys")
           echo "::add-mask::$anon"; echo "::add-mask::$svckey"
@@ -219,7 +229,8 @@ jobs:
 
           # the ticket's own migrations, when it has a middleware PR
           mwbr=$(gh pr list -R "$ORG/bluejay_middleware" --state open --search "$TICKET in:title" --limit 5 \
-                   --json headRefName,baseRefName -q 'first(.[]|select(.baseRefName=="main").headRefName) // ""') || mwbr=""
+                   --json headRefName,baseRefName,title \
+                   -q 'first(.[]|select(.baseRefName=="main" and ((.headRefName+.title)|contains("--np")|not)).headRefName) // ""') || mwbr=""
           if [ -n "$mwbr" ]; then
             git clone -q --depth 1 --branch "$mwbr" "https://x-access-token:$GH_TOKEN@github.com/$ORG/bluejay_middleware.git" /tmp/mw
             curl -fsSL -o /tmp/dbmate https://github.com/amacneil/dbmate/releases/download/v2.33.0/dbmate-linux-amd64
@@ -234,7 +245,8 @@ jobs:
           pr_fns=""
           for pair in evals:evaluator text_agent:text_agent livekit_dispatcher:livekit_dispatcher; do
             lr=${pair%%:*}; base=${pair##*:}
-            n=$(gh pr list -R "$ORG/$lr" --state open --search "$TICKET in:title" --limit 5 --json number -q 'first(.[].number) // ""') || n=""
+            n=$(gh pr list -R "$ORG/$lr" --state open --search "$TICKET in:title" --limit 5 --json number,headRefName,title \
+                  -q 'first(.[]|select((.headRefName+.title)|contains("--np")|not).number) // ""') || n=""
             [ -n "$n" ] && aws lambda get-function --function-name "pr${n}_$base" >/dev/null 2>&1 || continue
             kind=$base; [ "$base" = livekit_dispatcher ] && kind=dispatcher
             pr_fns="$pr_fns $kind:pr${n}_$base"; echo "$lr: pr${n}_$base"
@@ -254,7 +266,7 @@ jobs:
           for entry in $RAILWAY_REPOS; do
             svc=${entry##*:}
             while IFS=$'\t' read -r k v; do
-              args+=(--service-config "$svc" "variables.$k.value" "$v")
+              args+=(--service-config "$svc" "variables.$k.value" "$(base64 -d <<<"$v")")
             done < <(railway variables -s "$svc" -e "$BASE_ENV" --json | jq -r \
                        --arg r "$PREVIEW_DB_REF" --arg br "$bref" --arg p "$base_pw" --arg bp "$pw" \
                        --arg a "$base_anon" --arg ba "$anon" --arg s "$base_svc" --arg bs "$svckey" \
@@ -262,7 +274,7 @@ jobs:
                        'to_entries[] | select(.key|startswith("RAILWAY_")|not)
                         | select(.value|tostring|(contains($r) or contains($a) or contains($s) or contains("preview-base-")))
                         | [.key, (.value|split($r)|join($br)|split($p)|join($bp)|split($a)|join($ba)|split($s)|join($bs)
-                                  |split("preview-base-")|join($e))] | @tsv')
+                                  |split("preview-base-")|join($e)|@base64)] | @tsv')
           done
 
           # Recreate rather than patch: one command sets every branch atomically, and a
