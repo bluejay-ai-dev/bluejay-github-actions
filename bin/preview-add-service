@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Wire one preview-base service the way every preview service works: secrets in its Infisical
+project's `preview` env, readable only by the `preview` identity, and on Railway only what differs
+per preview (database, Supabase, sibling URLs). Prints names, never values.
+
+  bin/preview-add-service uptime sim-cron            known services, see SERVICES
+  bin/preview-add-service my-svc --project <infisical id> --from <prod railway service> \
+      --set MIDDLEWARE_URL='https://${{middleware.RAILWAY_PUBLIC_DOMAIN}}'
+
+Needs `infisical login` and `railway login`, plus PREVIEW_IDENTITY_ID, PREVIEW_IDENTITY_CLIENT_ID and
+PREVIEW_IDENTITY_CLIENT_SECRET (the `preview` machine identity, from Infisical). --dry-run writes nothing."""
+import argparse, json, os, re, subprocess, sys, urllib.error, urllib.request
+
+API = "https://app.infisical.com/api"
+BASE = "preview-base"
+MW, FE = "https://${{middleware.RAILWAY_PUBLIC_DOMAIN}}", "https://${{frontend.RAILWAY_PUBLIC_DOMAIN}}"
+# the worker answers whatever agent name middleware hands the dispatcher, so it follows middleware
+LK = {k: f"${{{{middleware.{k}}}}}" for k in ("OUTBOUND_AGENT_NAME", "INBOUND_AGENT_NAME", "SQS_EVAL_QUEUE_URL",
+                                              "RAG_INGESTION_SQS_QUEUE_URL", "METRONOME_SQS_QUEUE_URL")}
+LK.update({"MIDDLEWARE_URL": MW, "APP_ENV": "preview", "SENTRY_ENVIRONMENT": "preview", "LK_NUM_IDLE_PROCESSES": "1"})
+# preview-base service: (infisical project, prod railway service to copy vars from, infisical env to copy, railway-only vars)
+SERVICES = {
+    "uptime": ("a3d1f788-0e75-4cc2-8226-556d729ae992", "dev-uptime-monitor-service", "dev",
+               {"MIDDLEWARE_URL": MW, "APP_BASE_URL": FE, "REVIEW_BASE_URL": "https://${{RAILWAY_PUBLIC_DOMAIN}}",
+                "VAPI_AGENT_URL": "https://${{vapi-agent.RAILWAY_PUBLIC_DOMAIN}}"}),
+    "sim-cron": ("40be275d-da4d-4c6e-9641-8b168079b972", "dev-simulation-cron-service", "dev", {"MIDDLEWARE_INTERNAL_URL": MW}),
+    "summaries-cron": ("e407a633-431e-4690-8279-9fc0744f69c7", "dev-summaries-cron-service", "dev", {}),
+    "retention-sweep": ("94bafd8e-0136-4ba5-bbbb-3ef06a2a8eea", "dev-retention-sweep-service", "dev", {}),
+    "clusters-cron": ("071b61bc-f4fe-4281-9d87-11249fad021c", "dev-clusters-cron-service", "dev", {}),
+    "vapi-agent": ("e6d8bd6f-cda7-4754-b44f-168919cb71ee", "dev-vapi_agent", "dev", {"PUBLIC_URL": "https://${{RAILWAY_PUBLIC_DOMAIN}}"}),
+    "export": ("8e657aaa-8757-483e-b291-3ef1a034ec80", "dev-export-service", "dev", {"BLUEJAY_API_URL": MW}),
+    "collector": ("d9234b07-ea87-4bf2-8e24-27176db691e4", "collector-sandbox", "sandbox", {}),
+    "ingest": ("65eaf787-1f14-4333-85b9-e507ef53dd6d", "bluejay-ai-ingest-service", "dev", {}),
+    "lk-outbound": ("f3c164be-b60e-4346-9867-4e394ffbf445", None, "dev", LK),
+    "lk-inbound": ("f3c164be-b60e-4346-9867-4e394ffbf445", None, "dev", LK),
+}
+# differ per preview, so they live on Railway where preview-ticket swaps them
+PER_PREVIEW = {"SQS_NOTIFICATION_QUEUE_URL", "DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY",
+               "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_JWT_SECRET"}
+
+p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+p.add_argument("names", nargs="+", help="preview-base service names")
+p.add_argument("--project", help="Infisical project id (required for a service not in SERVICES)")
+p.add_argument("--from", dest="src", help="prod Railway service whose variables to copy")
+p.add_argument("--from-env", default="dev", help="Infisical env to copy secrets from (default dev)")
+p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="Railway-only variable, repeatable")
+p.add_argument("--dry-run", action="store_true", help="print what would change, write nothing")
+a = p.parse_args()
+
+
+def sh(*cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"{cmd[0]} {cmd[1]} failed: {r.stderr.strip()[-300:]}")
+    return r.stdout
+
+
+def rw(svc, env):
+    return json.loads(sh("railway", "variables", "-s", svc, "-e", env, "--json"))
+
+
+def inf(method, path, body=None):
+    if a.dry_run and method != "GET":
+        return {}
+    req = urllib.request.Request(API + path, method=method, data=json.dumps(body).encode() if body else None,
+                                 headers={"Authorization": f"Bearer {tok}", "content-type": "application/json"})
+    try:
+        return json.load(urllib.request.urlopen(req))
+    except urllib.error.HTTPError as e:
+        return {"statusCode": e.code, "message": e.read().decode()[:300]}
+
+
+ident, cid, csec = (os.environ.get(k) for k in ("PREVIEW_IDENTITY_ID", "PREVIEW_IDENTITY_CLIENT_ID", "PREVIEW_IDENTITY_CLIENT_SECRET"))
+if not all((ident, cid, csec)):
+    sys.exit("set PREVIEW_IDENTITY_ID, PREVIEW_IDENTITY_CLIENT_ID and PREVIEW_IDENTITY_CLIENT_SECRET")
+tok = sh("infisical", "user", "get", "token", "--plain").strip().splitlines()[-1]
+mw = rw("middleware", BASE)
+
+
+def db(orig):
+    q = orig.split("?", 1)[1] if "?" in orig else ""
+    return f"{orig.split('://')[0]}://{mw['DATABASE_URL'].split('://', 1)[1]}" + (f"?{q}" if q else "")
+
+
+for name in a.names:
+    proj, src, srcenv, extra = SERVICES.get(name, (a.project, a.src, a.from_env, {}))
+    if not proj:
+        sys.exit(f"{name}: not in SERVICES, pass --project")
+    extra = {**extra, **dict(kv.split("=", 1) for kv in a.set)}
+    ws = inf("GET", f"/v1/workspace/{proj}")["workspace"]
+    if "preview" not in [e["slug"] for e in ws["environments"]]:
+        inf("POST", f"/v1/workspace/{proj}/environments", {"name": "Preview", "slug": "preview"})
+    inf("POST", f"/v1/workspace/{ws['slug']}/roles", {"slug": "preview-reader", "name": "Preview reader", "permissions": [
+        {"subject": "secrets", "action": "read", "conditions": {"environment": "preview"}},
+        {"subject": "secret-folders", "action": "read", "conditions": {"environment": "preview"}}]})
+    r = inf("POST", f"/v2/workspace/{proj}/identity-memberships/{ident}", {"roles": [{"role": "preview-reader", "isTemporary": False}]})
+    # already a member is fine; anything else leaves the service unable to read its secrets
+    if r.get("statusCode") and "already" not in r["message"]:
+        sys.exit(f"{name}: needs a project admin to add the preview identity as preview-reader: {r['message']}")
+
+    s = {k.strip(): v for k, v in (rw(src, "production") if src else {}).items() if not k.startswith(("RAILWAY_", "INFISICAL_"))}
+    s.update({x["secretKey"]: x["secretValue"] for x in
+              inf("GET", f"/v3/secrets/raw?workspaceId={proj}&environment={srcenv}&secretPath=/").get("secrets", [])})
+    for k, v in list(s.items()):
+        if k == "DATABASE_URL" and "://" in v: s[k] = db(v)
+        elif k == "SUPABASE_URL": s[k] = mw["SUPABASE_URL"]
+        elif k in ("SUPABASE_SERVICE_KEY", "SUPABASE_SERVICE_ROLE_KEY"): s[k] = mw["SUPABASE_SERVICE_KEY"]
+        elif k == "SUPABASE_JWT_SECRET": s[k] = mw["SUPABASE_JWT_SECRET"]
+        elif k.startswith("CLICKHOUSE_") and k in mw: s[k] = mw[k]
+        elif k == "KAFKA_CLIENT_ID": s[k] = f"{name}-preview"
+        elif k.startswith("KAFKA_") and k in mw: s[k] = mw[k]
+        elif k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "REDIS_URL", "INTERNAL_API_TOKEN", "API_KEY_HASH_SECRET") and k in mw: s[k] = mw[k]
+        elif k == "SQS_NOTIFICATION_QUEUE_URL": s[k] = mw["NOTIFICATION_SQS_QUEUE_URL"]
+        elif "sqs." in v and "/Dev" in v: s[k] = v.replace("/Dev", "/Sandbox")
+    railway = {k: s.pop(k) for k in list(s) if k in PER_PREVIEW}
+    for k in extra: s.pop(k, None)
+    railway.update(extra)
+    railway.update({"INFISICAL_CLIENT_ID": cid, "INFISICAL_CLIENT_SECRET": csec, "INFISICAL_PROJECT_ID": proj,
+                    "INFISICAL_ENVIRONMENT": "preview", "PREVIEW_IDLE": "0"})
+
+    have = {x["secretKey"] for x in inf("GET", f"/v3/secrets/raw?workspaceId={proj}&environment=preview&secretPath=/").get("secrets", [])}
+    # Infisical wins over Railway at runtime, so anything Railway owns must not be here
+    for method, batch in (("POST", [{"secretKey": k, "secretValue": v} for k, v in s.items() if k not in have]),
+                          ("PATCH", [{"secretKey": k, "secretValue": v} for k, v in s.items() if k in have]),
+                          ("DELETE", [{"secretKey": k} for k in have if k in railway])):
+        if batch:
+            r = inf(method, "/v3/secrets/batch/raw", {"workspaceId": proj, "environment": "preview", "secretPath": "/", "secrets": batch})
+            if r.get("statusCode"): sys.exit(f"{name}: infisical {method} failed: {r['message']}")
+    if not a.dry_run:
+        sh("railway", "variables", "-s", name, "-e", BASE, "--skip-deploys", *sum((["--set", f"{k}={v}"] for k, v in railway.items()), []))
+    left = [k for k, v in s.items() if re.search(r"fkfxvtjmvwkrachwdcvc|rmyzodjbixackacyinfi|api\.dev\.|app\.dev\.|/Dev[A-Z]", v)]
+    print(f"{name}{' (dry run)' if a.dry_run else ''}: infisical={len(s)} railway={sorted(railway)} still-dev={left}")
