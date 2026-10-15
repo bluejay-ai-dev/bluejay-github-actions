@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""End-to-end smoke check of one Railway preview environment. Reads the environment's own
+middleware variables (database, hash secret, AWS key, queues), mints an idempotent API key
+for its org, then drives a chat sim and a web voice sim through the public API and checks
+evals, uptime and notifications. Email sims are not covered: previews have no inbox yet.
+
+  bin/preview-smoke [env]        env defaults to preview-base
+
+Needs the railway CLI logged in, psql and the aws CLI. Prints names and ids, never secrets.
+Exit 1 when any check fails."""
+import hashlib, hmac, json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
+
+ENV = sys.argv[1] if len(sys.argv) > 1 else "preview-base"
+PROJECT = "7047af18-477f-42e0-a905-f2e8f7ccac0f"
+DONE = {"COMPLETED", "NO_CONNECTION", "NO_ANSWER", "SYSTEM_ERROR", "CUSTOM_ERROR", "CANCELLED"}
+
+
+def sh(*a, **kw):
+    return subprocess.run(a, capture_output=True, text=True, check=True, **kw).stdout.strip()
+
+
+def rvars(svc):
+    return json.loads(sh("railway", "variables", "-p", PROJECT, "-s", svc, "-e", ENV, "--json"))
+
+
+mw_vars, fe_vars = rvars("middleware"), rvars("frontend")
+MW = f"https://{mw_vars['RAILWAY_PUBLIC_DOMAIN']}"
+FE = f"https://{fe_vars['RAILWAY_PUBLIC_DOMAIN']}"
+# the session pooler on 5432 caps at 15 clients and the services hold them, so read through 6543
+DB = mw_vars["DATABASE_URL"].replace("+asyncpg", "").replace(":5432/", ":6543/")
+aws_env = {**os.environ, "AWS_REGION": "us-west-1", "AWS_ACCESS_KEY_ID": mw_vars["AWS_ACCESS_KEY_ID"],
+           "AWS_SECRET_ACCESS_KEY": mw_vars["AWS_SECRET_ACCESS_KEY"]}
+for k in ("AWS_PROFILE", "AWS_SESSION_TOKEN"):
+    aws_env.pop(k, None)
+results = []
+# python.org builds on macOS ship without a CA bundle
+CTX = ssl.create_default_context(cafile="/etc/ssl/cert.pem" if os.path.exists("/etc/ssl/cert.pem") else None)
+
+
+def check(name, ok, detail=""):
+    results.append(ok)
+    print(f"{'PASS' if ok else 'FAIL'}  {name}{'  ' + detail if detail else ''}", flush=True)
+
+
+def sql(q):
+    return sh("psql", DB, "-X", "-tA", "-v", "ON_ERROR_STOP=1", "-c", q)
+
+
+def http(url):
+    try:
+        return urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=20, context=CTX).status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return 0
+
+
+def api(path, body):
+    req = urllib.request.Request(f"{MW}/v1/{path}", data=json.dumps(body).encode(), method="POST",
+                                 headers={"X-API-Key": KEY, "content-type": "application/json"})
+    try:
+        return json.load(urllib.request.urlopen(req, timeout=120, context=CTX))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"{path} {e.code}: {e.read().decode()[:300]}") from None
+
+
+def aws(*a):
+    return subprocess.run(["aws", *a, "--output", "json"], capture_output=True, text=True, env=aws_env)
+
+
+check("middleware up", http(f"{MW}/health") == 200, MW)
+check("frontend up", http(FE) in (200, 307, 308), FE)
+
+# deterministic from the env's own hash secret, so reruns reuse one row instead of minting more
+secret = mw_vars["API_KEY_HASH_SECRET"]
+KEY = "pvsmoke_" + hmac.new(secret.encode(), b"preview-smoke", hashlib.sha256).hexdigest()[:40]
+hashed = hmac.new(secret.encode(), KEY.encode(), hashlib.sha256).hexdigest()
+org = sql("select id from organizations order by created_at limit 1")
+sql(f"insert into api_keys (organization_id, hashed_key, scope, name, key_prefix, key_suffix) "
+    f"select '{org}', '{hashed}', 'full', 'preview-smoke', '{KEY[:3]}', '{KEY[-3:]}' "
+    f"where not exists (select 1 from api_keys where hashed_key = '{hashed}')")
+
+
+def run_sim(label, agent_body):
+    agent = api("add-agent", {"name": f"preview-smoke {label}", "system_prompt": "You are a terse order status desk.",
+                              "knowledge_base": "", "goals": ["Answer order status"], **agent_body})
+    agent_id = agent.get("agent_id") or agent.get("id")
+    sim = api("create-simulation", {"agent_id": str(agent_id), "name": f"preview-smoke {label}"})
+    sim_id = sim.get("simulation_id") or sim.get("id")
+    api("create-digital-humans", {"simulation_ids": [int(sim_id)], "digital_humans": [{
+        "name": "Smoke caller", "intent": "Ask whether order 1234 has shipped, then thank them and end the conversation.",
+        "success_criteria": "The agent says whether order 1234 shipped."}]})
+    run = api("queue-simulation-run", {"simulation_id": str(sim_id)})
+    run_id = run.get("simulation_run_id") or run.get("id")
+    scid, seen, err, deadline = "", "", "", time.time() + 900
+    while time.time() < deadline:
+        rows = sql(f"select sim_conversation_id, status, coalesce(error_code, '') from sim_conversations "
+                   f"where simulation_run_id = {run_id} order by 1 limit 1")
+        if rows:
+            scid, status, err = rows.split("|")
+            seen = status
+            if status in DONE:
+                break
+        time.sleep(10)
+    evals = sql(f"select count(*) from metric_results where sim_conversation_id = {scid}") if scid else "0"
+    return dict(agent=agent_id, sim=sim_id, run=run_id, conversation=scid, status=seen, error=err, evals=int(evals or 0))
+
+
+okey = mw_vars["OPENAI_API_KEY"]
+for label, body in (("chat", {"mode": "TEXT", "connection_type": "OPENAI_CHAT", "openai_base_url": "https://api.openai.com/v1",
+                              "openai_api_key": okey, "openai_model": "gpt-4o-mini"}),
+                    ("voice", {"mode": "VOICE", "connection_type": "OPENAI_REALTIME", "openai_api_key": okey,
+                               "openai_model": "gpt-4o-realtime-preview"})):
+    try:
+        r = run_sim(label, body)
+    except Exception as e:
+        check(f"{label} sim", False, str(e)[:300])
+        continue
+    ids = f"agent {r['agent']} sim {r['sim']} run {r['run']} conversation {r['conversation']} status {r['status']} {r['error']}"
+    check(f"{label} sim completed", r["status"] == "COMPLETED", ids)
+    check(f"{label} evals wrote metric_results", r["evals"] > 0, f"{r['evals']} rows")
+
+since = int(time.time()) - 6 * 3600
+up = sql("select count(*), count(*) filter (where enabled), max(last_checked_at) from uptime_monitors")
+check("uptime monitors checked in the last 6h", sql(
+    f"select count(*) from uptime_monitors where enabled and last_checked_at > to_timestamp({since})") not in ("", "0"),
+    f"monitors total|enabled|last check = {up}")
+
+q = f"{ENV}-notification.fifo"
+m = aws("cloudwatch", "get-metric-statistics", "--namespace", "AWS/SQS", "--metric-name", "NumberOfMessagesSent",
+        "--dimensions", f"Name=QueueName,Value={q}", "--start-time", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)),
+        "--end-time", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "--period", "21600", "--statistics", "Sum")
+sent = sum(d["Sum"] for d in json.loads(m.stdout or "{}").get("Datapoints", [])) if m.returncode == 0 else -1
+check("notification queue received messages in the last 6h", sent > 0, f"{q}: {int(sent)} sent" if sent >= 0 else m.stderr[-200:])
+
+print("SKIP  email sims: previews have no per-preview inbox yet")
+sys.exit(0 if all(results) else 1)
