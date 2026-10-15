@@ -1,0 +1,21 @@
+.github/workflows/preview-cleanup.yml
+  s_f8c985c0bfa3ef::t_1138799d68ff40 1-54,56-67,72-75,77-91
+bin/preview-add-service
+  s_f8c985c0bfa3ef::t_0ba24a8d0ddb2c 1-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ee1405dea822022091424a6fcda5f96fbf10b07d",
+  "prompts": {},
+  "sessions": {
+    "s_f8c985c0bfa3ef": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c7b25754-4de2-4673-a727-c11160123c8c",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Lorenzo Taylor <lmtaylor9@dons.usfca.edu>"
+    }
+  }
+}
