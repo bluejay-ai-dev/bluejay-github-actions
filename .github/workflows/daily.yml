@@ -1,0 +1,152 @@
+# Daily health check against prod.
+#
+# The promotion gate runs the same suite.sh before a release. This runs it after, on a
+# schedule, because the failure that started this ran green through every check and still
+# took sign-in down: the release was fine, the ORDER it reached prod in was not. Nothing
+# that inspects a pull request can see that. Only something that talks to prod can.
+#
+# It pages on red and stays quiet on amber, because a daily that cries about a carrier
+# dropping one call is a daily people mute, and a muted daily is worse than none.
+name: daily
+
+on:
+  # Missing fixtures end the run as verdict "fixture", which never pages. bin/DAILY_FIXTURES.md
+  # lists what has to exist.
+  schedule:
+    - cron: '30 15 * * *'  # 15:30 UTC = 8:30 AM PDT (7:30 AM PST)
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: 'Parts to run (blank = the full run; a provider call is call:<name>)'
+        required: false
+        default: ''
+
+concurrency:
+  group: daily
+  cancel-in-progress: false
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    # One call per provider at up to ~5 min each, plus an amber retry.
+    timeout-minutes: 75
+    outputs:
+      verdict: ${{ steps.run.outputs.verdict }}
+      summary: ${{ steps.run.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Cache playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ hashFiles('bin/package.json') }}
+
+      - name: Install
+        working-directory: bin
+        run: npm ci --silent && npx playwright install --with-deps chromium
+
+      # Proves the classifier and the chat tap still behave before anything is believed
+      # about prod. It is offline, so it cannot be the thing that is broken.
+      - name: Self-check
+        working-directory: bin
+        run: ./suite.sh selftest
+
+      - name: Run the suite against prod
+        id: run
+        working-directory: bin
+        env:
+          SUITE_FRONTEND_URL: ${{ vars.PROD_FRONTEND_URL }}
+          SUITE_API_URL: ${{ vars.PROD_API_URL }}
+          TEST_SUITE_BLUEJAY_API_KEY: ${{ secrets.DAILY_BLUEJAY_API_KEY }}
+          TEST_SUITE_BLUEJAY_API_KEY_B: ${{ secrets.DAILY_BLUEJAY_API_KEY_B }}
+          SUITE_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          SUITE_SUPABASE_ANON_KEY: ${{ secrets.PROD_SUPABASE_ANON_KEY }}
+          SUITE_SUPABASE_SERVICE_KEY: ${{ secrets.PROD_SUPABASE_SERVICE_KEY }}
+          SUITE_USER_EMAIL: ${{ secrets.DAILY_USER_EMAIL }}
+          SUITE_EXPECT_CAPTCHA: '1'
+          TEST_SUITE_SIM_TEXT: ${{ vars.DAILY_SIM_TEXT }}
+          TEST_SUITE_SIM_SMS: ${{ vars.DAILY_SIM_SMS }}
+          TEST_SUITE_SIM_OUTBOUND: ${{ vars.DAILY_SIM_OUTBOUND }}
+          TEST_SUITE_AGENT_OUTBOUND: ${{ vars.DAILY_AGENT_OUTBOUND }}
+          TEST_SUITE_SIM_INBOUND: ${{ vars.DAILY_SIM_INBOUND }}
+          TEST_SUITE_AGENT_INBOUND: ${{ vars.DAILY_AGENT_INBOUND }}
+          TEST_SUITE_AGENT_ID: ${{ vars.DAILY_AGENT_ID }}
+          TEST_SUITE_ECHO_URL: ${{ vars.DAILY_ECHO_URL }}
+          TEST_SUITE_SIM_WEBCHAT: ${{ vars.DAILY_SIM_WEBCHAT }}
+          TEST_SUITE_PROVIDERS: ${{ vars.DAILY_PROVIDERS }}
+          SUITE_DAILY: '1'
+          PARTS: ${{ inputs.parts }}
+        run: |
+          set +e
+          if [ -n "$PARTS" ]; then
+            rc=0 failed=''
+            for p in $PARTS; do
+              case $p in call:*) ./suite.sh call "${p#call:}" ;; *) ./suite.sh "$p" ;; esac
+              r=$?
+              [ $r = 1 ] && failed+=" $p"
+              [ $r != 0 ] && { [ $rc = 0 ] || [ $r = 1 ]; } && rc=$r
+            done > /tmp/out 2>&1
+            cat /tmp/out
+            # A manual run prints no closing line, so write the one the pager reads.
+            [ $rc = 1 ] && echo "FAIL:$failed in 0s" >> /tmp/out
+          else
+            ./suite.sh run 2>&1 | tee /tmp/out
+            rc=${PIPESTATUS[0]}
+          fi
+          case $rc in
+            0) v=green ;;
+            3) v=fixture ;;   # our own test data rotted; not a product failure
+            4) v=config ;;    # a provider's credentials are red
+            5) v=amber ;;     # a carrier dropped or did not answer, twice; reported, never paged
+            *) v=red ;;
+          esac
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"
+          {
+            echo 'summary<<EOF'
+            grep -E '^(ok|FAIL|MISS|AMBER)' /tmp/out | head -20
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          case $v in
+            green)   why='every part passed' ;;
+            red)     why='a part failed, PagerDuty was paged' ;;
+            amber)   why='a call was dropped or not answered twice; carrier noise, not paged, look if it repeats' ;;
+            fixture) why='our own prod fixtures are missing or broken (see MISS lines and bin/DAILY_FIXTURES.md); not paged' ;;
+            config)  why='a provider credential check is red, so the calls were skipped; not paged' ;;
+          esac
+          {
+            echo "### daily: $v"
+            echo "$why"
+            echo '```'
+            grep -E '^(ok|FAIL|MISS|AMBER|PASS)' /tmp/out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Keep the evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-${{ github.run_id }}
+          path: |
+            /tmp/out
+            /tmp/suite-*.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # Red triggers one PagerDuty incident (fixed dedup key), green resolves it. Amber,
+      # fixture and config only show in the run summary above.
+      - name: Page on red, resolve on green
+        if: always() && contains(fromJSON('["red", "green", ""]'), steps.run.outputs.verdict)
+        env:
+          VERDICT: ${{ steps.run.outputs.verdict }}
+          ROUTING_KEY: ${{ secrets.DAILY_PAGERDUTY_ROUTING_KEY }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 bin/daily-page.py /tmp/out
+
+# No Slack job on purpose: PagerDuty is the one place a red daily goes. A person who
+# broke their own batch is DM'd by notify.sh rather than told in a channel.

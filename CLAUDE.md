@@ -9,7 +9,7 @@ a `gating-trial` label.
 Branch off `main` → one PR per repo, each titled `[ENG-123]` → `pr-checks` refuses to pass
 any of them until every sibling on that id is green → reviewer approves each → run
 `enqueue` with the ticket → it merges them all in dependency order or none of them →
-`nightly` runs the suite against prod afterwards.
+`daily` runs the suite against prod afterwards.
 
 The ticket id in the PR title is the only thing that groups PRs across repos. There is no
 manifest and nothing external in the merge path.
@@ -21,7 +21,7 @@ manifest and nothing external in the merge path.
 | `pr-checks.yml` | `workflow_call` | ticket gate, sibling gate, build, deterministic checks |
 | `enqueue.yml` | manual | merges a whole ticket in order, or nothing |
 | `hotfix.yml` | manual | one PR straight to main, for incidents, still needs green checks |
-| `nightly.yml` | manual only | runs the suite against prod. The 09:00 UTC schedule is commented out until `TEST_SUITE_*` exists, because a run with no fixtures dies at preflight and a workflow that goes red every morning teaches people to ignore red |
+| `daily.yml` | 8:30 AM Pacific (15:30 UTC), manual | runs the suite against prod, one call per voice provider, pages on red and resolves on green. Missing fixtures end as `fixture` and never page; `bin/DAILY_FIXTURES.md` lists them |
 
 ## Scripts
 
@@ -31,6 +31,7 @@ manifest and nothing external in the merge path.
 | `bin/gate.sh` | siblings, closure, and `order` (merge tiers from `.release/order.yml`) |
 | `bin/enqueue.sh` | readiness, tier ordering, squash merge, deploy waits, rollback |
 | `bin/suite.sh` | the integration suite, one subcommand per part |
+| `bin/daily-page.py` | PagerDuty trigger or resolve for the daily |
 | `bin/notify.sh` | DMs the authors on a ticket and moves it to Needs Prod Testing |
 | `bin/people.tsv` | github login to slack user id; a missing row falls back to the channel |
 | `bin/*.mjs` | playwright walks |
@@ -105,8 +106,8 @@ which is `actions:write` on this repo only and cannot read anything else.
 - `INFISICAL_TOKEN` and `RAILWAY_TOKEN` are still unset. The build job skips the Infisical
   step when absent, so this degrades rather than breaking.
 - `suite.sh preflight` is the manifest for the suite's own fixtures and cannot drift from
-  the code. `TEST_SUITE_*` does not exist yet, which is why the nightly schedule is
-  commented out.
+  the code. The daily's prod fixtures are listed in `bin/DAILY_FIXTURES.md` and are not
+  set yet.
 - A GitHub App as the only bypass actor on the main ruleset, `MERGE_APP_ID` and
   `MERGE_APP_PRIVATE_KEY`. Without it `enqueue check` works and `enqueue run` cannot merge.
 - Neither middleware nor the frontend exposes a deployed SHA, so `suite.sh sha` exits 3

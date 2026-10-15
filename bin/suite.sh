@@ -3,7 +3,8 @@
 #
 #   suite.sh run <frontend_url> [api_url]   everything the batch earns
 #   suite.sh <part> [args]                  one part, for debugging
-#   parts: preflight sha creds signup text sms traces browser bluejayai outbound inbound redteam uptime
+#   parts: preflight sha creds signup text webchat sms traces browser bluejayai outbound inbound redteam uptime
+#   suite.sh call <name>                    one voice call from TEST_SUITE_PROVIDERS
 #
 # Exit: 0 pass | 1 regression | 2 usage | 3 fixtures or prereqs missing | 4 provider config red | 5 amber
 #
@@ -56,6 +57,7 @@ verdict() {
   case "$1" in
     COMPLETED|CONVERSATION_ENDED|RUNNING|EVALUATING) echo green ;;
     NO_ANSWER|CALL_DROPPED)                         echo amber ;;
+    INITIALIZING|QUEUED|READY|DISPATCHED)           echo pending ;;
     *)                                              echo red ;;
   esac
 }
@@ -73,11 +75,13 @@ result_of() {
 # dispatch, so a 200 from the queue endpoint means nothing and a stuck dispatch has to
 # fail in 45s rather than burn the whole 300.
 await() {  # await <result_id> <wanted...|deadline> ; echoes the status it settled on
-  local id=$1 want=$2 deadline=$3 end=$((SECONDS + deadline)) s
+  # Two locals on purpose: bash expands a local's arguments before assigning any of them.
+  local id=$1 want=$2 deadline=$3 s
+  local end=$((SECONDS + deadline))
   while [ $SECONDS -lt "$end" ]; do
     s=$(result_of "$id")
     grep -qw -- "$s" <<<"$want" && { echo "$s"; return; }
-    [ "$(verdict "$s")" = green ] || { echo "$s"; return; }
+    case $(verdict "$s") in green|pending) ;; *) echo "$s"; return ;; esac
     sleep 5
   done
   echo "STUCK_IN_${s:-UNKNOWN}"
@@ -114,13 +118,21 @@ cmd_preflight() {
   done
   touched 'red.?team' && need TEST_SUITE_AGENT_REDTEAM >/dev/null
   touched 'uptime'    && need TEST_SUITE_MONITOR_ID >/dev/null
+  if [ -n "${SUITE_DAILY:-}" ]; then
+    need TEST_SUITE_SIM_WEBCHAT >/dev/null
+    need TEST_SUITE_PROVIDERS >/dev/null
+    jq -e 'type == "array" and length > 0 and all(.name | test("^[a-z0-9_-]+$"))' <<<"$TEST_SUITE_PROVIDERS" >/dev/null \
+      || miss preflight "TEST_SUITE_PROVIDERS is not a JSON list of {name, sim_id, agent_id} with lowercase names"
+  fi
 
   local code
-  for a in "$TEST_SUITE_AGENT_ID" "$TEST_SUITE_AGENT_OUTBOUND" "$TEST_SUITE_AGENT_INBOUND"; do
+  for a in "$TEST_SUITE_AGENT_ID" "$TEST_SUITE_AGENT_OUTBOUND" "$TEST_SUITE_AGENT_INBOUND" \
+           $(jq -r '.[].agent_id' <<<"${TEST_SUITE_PROVIDERS:-[]}"); do
     code=$(call GET "/v1/agents/$a")
     [ "$code" = 200 ] || miss preflight "agent $a -> $code (revoked key, or a dev DB rebuild took the fixture)"
   done
-  for x in "$TEST_SUITE_SIM_TEXT" "$TEST_SUITE_SIM_SMS" "$TEST_SUITE_SIM_OUTBOUND" "$TEST_SUITE_SIM_INBOUND"; do
+  for x in "$TEST_SUITE_SIM_TEXT" "$TEST_SUITE_SIM_SMS" "$TEST_SUITE_SIM_OUTBOUND" "$TEST_SUITE_SIM_INBOUND" \
+           ${TEST_SUITE_SIM_WEBCHAT:-} $(jq -r '.[].sim_id' <<<"${TEST_SUITE_PROVIDERS:-[]}"); do
     code=$(call GET "/v1/simulation/$x")
     [ "$code" = 200 ] || miss preflight "simulation $x -> $code (fixture gone)"
   done
@@ -194,45 +206,53 @@ cmd_creds() {
 
 # The deepest path with no carrier in it: middleware, text_agent, redis, webhook dispatch,
 # SQS, evals, ClickHouse. Highest coverage per second in the suite.
-cmd_text() {
-  local sim; sim=$(need TEST_SUITE_SIM_TEXT)
+#
+# webchat is the same queue and turn loop with a chat-driver agent (OPENAI_CHAT) instead of
+# a customer webhook, so the middleware drives the conversation itself.
+cmd_text()    { local s; s=$(need TEST_SUITE_SIM_TEXT)    || return $E_FIXTURE; http_text text "$s"; }
+cmd_webchat() { local s; s=$(need TEST_SUITE_SIM_WEBCHAT) || return $E_FIXTURE; http_text webchat "$s"; }
+http_text() {
+  local part=$1 sim=$2
   local code; code=$(call POST /v1/queue-http-text-simulation-run \
     "{\"simulation_id\":\"$sim\",\"runs_per_digital_human\":1}")
-  [ "$code" = 200 ] || { bad text "queue -> $code $(body | head -c 200)"; return $E_FAIL; }
+  [ "$code" = 200 ] || { bad "$part" "queue -> $code $(body | head -c 200)"; return $E_FAIL; }
   local run rid
   run=$(body | jq -r '.simulation_run_id'); rid=$(body | jq -r '.simulation_result_ids[0]')
 
   local s
   s=$(await "$rid" "RUNNING CONVERSATION_ENDED EVALUATING COMPLETED" 45)
-  [ "$(verdict "$s")" = green ] || { bad text "never left the queue: $s"; return $E_FAIL; }
+  [ "$(verdict "$s")" = green ] || { bad "$part" "never left the queue: $s"; return $E_FAIL; }
   s=$(await "$rid" "CONVERSATION_ENDED EVALUATING COMPLETED" 180)
-  [ "$(verdict "$s")" = green ] || { bad text "conversation failed: $s"; return $E_FAIL; }
+  [ "$(verdict "$s")" = green ] || { bad "$part" "conversation failed: $s"; return $E_FAIL; }
   s=$(await "$rid" "COMPLETED" 300)
   case "$(verdict "$s")" in
     green) ;;
-    amber) bad text "amber: $s"; return $E_AMBER ;;
-    *)     bad text "$s"; return $E_FAIL ;;
+    amber) bad "$part" "amber: $s"; return $E_AMBER ;;
+    *)     bad "$part" "$s"; return $E_FAIL ;;
   esac
 
   call GET "/v1/retrieve-simulation-result/$rid" >/dev/null
   local evals url turns
   evals=$(body | jq '.simulation_result.metrics | length // 0')
   url=$(body | jq -r '.simulation_result.transcript_url // empty')
-  [ "${evals:-0}" -gt 0 ] || { bad text "COMPLETED with no metric results: evals or the ClickHouse write is broken"; return $E_FAIL; }
-  [ -n "$url" ] || { bad text "COMPLETED with no transcript_url"; return $E_FAIL; }
-
-  curl -s --max-time 30 "$url" -o /tmp/suite.tx || { bad text "transcript_url unfetchable"; return $E_FAIL; }
+  [ "${evals:-0}" -gt 0 ] || { bad "$part" "COMPLETED with no metric results: evals or the ClickHouse write is broken"; return $E_FAIL; }
+  # The API inlines the transcript when it has one and only signs a URL when it does not.
+  body | jq '.simulation_result.transcript // []' > /tmp/suite.tx
+  if ! jq -e 'length > 0' /tmp/suite.tx >/dev/null 2>&1; then
+    [ -n "$url" ] || { bad "$part" "COMPLETED with no transcript"; return $E_FAIL; }
+    curl -s --max-time 30 "$url" -o /tmp/suite.tx || { bad "$part" "transcript_url unfetchable"; return $E_FAIL; }
+  fi
   turns=$(jq '[.. | objects | select(has("speaker") or has("role"))] | length' /tmp/suite.tx 2>/dev/null)
-  [ "${turns:-0}" -ge 4 ] || { bad text "only $turns turns, expected >= 4"; return $E_FAIL; }
+  [ "${turns:-0}" -ge 4 ] || { bad "$part" "only $turns turns, expected >= 4"; return $E_FAIL; }
 
   # Hand the browser part something concrete to look for.
-  {
+  [ "$part" = text ] && {
     echo "SUITE_SIM_ID=$sim"; echo "SUITE_RUN_ID=$run"; echo "SUITE_RESULT_ID=$rid"
     jq -r '[.. | objects | select(has("speaker") or has("role"))][0]
            | (.utterance // .text // .content // "") | .[0:40]
-           | "SUITE_EXPECT_TEXT=" + .' /tmp/suite.tx 2>/dev/null
+           | "SUITE_EXPECT_TEXT=" + @sh' /tmp/suite.tx 2>/dev/null
   } > /tmp/suite.text.env
-  ok text "run $run, $turns turns, $evals metric results"
+  ok "$part" "run $run, $turns turns, $evals metric results"
 }
 
 cmd_sms() {
@@ -255,11 +275,15 @@ cmd_sms() {
 
   call GET "/v1/retrieve-simulation-result/$rid" >/dev/null
   local url; url=$(body | jq -r '.simulation_result.transcript_url // empty')
-  [ -n "$url" ] || { bad sms "$s with no transcript_url"; return $E_FAIL; }
-  curl -s --max-time 30 "$url" -o /tmp/suite.sms || { bad sms "transcript_url unfetchable"; return $E_FAIL; }
+  body | jq '.simulation_result.transcript // []' > /tmp/suite.sms
+  if ! jq -e 'length > 0' /tmp/suite.sms >/dev/null 2>&1; then
+    [ -n "$url" ] || { bad sms "$s with no transcript"; return $E_FAIL; }
+    curl -s --max-time 30 "$url" -o /tmp/suite.sms || { bad sms "transcript_url unfetchable"; return $E_FAIL; }
+  fi
   local inb outb
   inb=$(jq '[.. | objects | select((.speaker // .role // "") | test("agent|assistant";"i"))] | length' /tmp/suite.sms 2>/dev/null)
-  outb=$(jq '[.. | objects | select((.speaker // .role // "") | test("human|user|digital";"i"))] | length' /tmp/suite.sms 2>/dev/null)
+  # The digital human's turns carry its own name as the speaker, so count everything not the agent.
+  outb=$(jq '[.. | objects | select(has("speaker") or has("role")) | select((.speaker // .role) | test("agent|assistant";"i") | not)] | length' /tmp/suite.sms 2>/dev/null)
   [ "${inb:-0}" -ge 2 ] && [ "${outb:-0}" -ge 2 ] || { bad sms "$inb in / $outb out, expected >= 2 each"; return $E_FAIL; }
   ok sms "$s, $inb in / $outb out"
 }
@@ -369,7 +393,7 @@ cmd_bluejayai() {
 # Highest coverage per second in the system, which is why it survives the cut.
 voice() {
   local part=$1 sim=$2 agent=$3 deadline=$4
-  local extra; extra=$(agent_run_extra "$agent")
+  local extra; extra=$(agent_run_extra "$agent") || return $E_FIXTURE
   local payload; payload=$(jq -cn --arg s "$sim" --argjson e "$extra" \
     '{simulation_id:$s, runs_per_digital_human:1} + $e')
   local code; code=$(call POST /v1/queue-simulation-run "$payload")
@@ -400,8 +424,17 @@ cmd_inbound() {
   voice inbound "$s" "$a" 240
 }
 
+# One real call per voice provider, so a single provider's bridge breaking is named, not
+# averaged away. Parts are "call:<name>" so the summary line says which provider.
+provider_parts() { jq -r '.[] | "call:" + .name' <<<"${TEST_SUITE_PROVIDERS:-[]}"; }
+cmd_call() {
+  local p; p=$(jq -c --arg n "$1" '.[] | select(.name == $n)' <<<"${TEST_SUITE_PROVIDERS:-[]}")
+  [ -n "$p" ] || miss "call:$1" "no provider named $1 in TEST_SUITE_PROVIDERS"
+  voice "call:$1" "$(jq -r .sim_id <<<"$p")" "$(jq -r .agent_id <<<"$p")" 240
+}
+
 # Proves the red-team pipeline dispatches, which is all a merge gate should claim. A run
-# that actually red teams is a nightly job: every probe here is a real billed voice call,
+# that actually red teams is a daily job: every probe here is a real billed voice call,
 # so it is capped at one and stopped as soon as it is moving.
 cmd_redteam() {
   local agent; agent=$(need TEST_SUITE_AGENT_REDTEAM)
@@ -447,45 +480,62 @@ attempt() {
   [ $rc = $E_AMBER ] || return $rc
   note "amber, one retry"
   SUITE_ATTEMPT=2 "$@"; rc=$?
-  [ $rc = $E_AMBER ] && rc=$E_FAIL
+  # The gate blocks on amber twice. The daily reports it and does not page.
+  [ $rc = $E_AMBER ] && [ -z "${SUITE_DAILY:-}" ] && rc=$E_FAIL
   return $rc
 }
 
 cmd_run() {
   FE=${1:-$FE}; API=${2:-$API}
-  [ -n "$FE" ] || { echo "usage: suite.sh run <frontend_url> [api_url]" >&2; exit $E_USAGE; }
+  # The daily passes the URL as a repo variable; unset is a missing fixture, not a red.
+  [ -n "$FE" ] || miss run "SUITE_FRONTEND_URL is unset (usage: suite.sh run <frontend_url> [api_url])"
   FE=${FE%/}; API=${API%/}
   export SUITE_FRONTEND_URL=$FE SUITE_API_URL=$API
-  local t0=$SECONDS rc=0 failed=()
+  local t0=$SECONDS rc=0 config='' failed=() ambered=() missed=()
 
   cmd_preflight || exit $?
-  local skip=" " prc
-  for part in sha creds signup text sms traces browser bluejayai outbound inbound; do
+  local skip=" " prc calls
+  calls=$(provider_parts | tr '\n' ' ')
+  # The gate has no webchat or provider fixtures; the daily's preflight requires them.
+  [ -n "${TEST_SUITE_SIM_WEBCHAT:-}" ] || skip+="webchat "
+  for part in sha creds signup text webchat sms traces browser bluejayai outbound inbound $calls; do
     [[ $skip == *" $part "* ]] && { note "skipped $part"; continue; }
-    attempt "cmd_$part"
+    case $part in
+      call:*) attempt cmd_call "${part#call:}" ;;
+      *)      attempt "cmd_$part" ;;
+    esac
     prc=$?
     case $prc in
       0) ;;
-      "$E_FIXTURE") exit $E_FIXTURE ;;
+      # Keep going: a fixture gone mid-run must not hide a part that already failed.
+      "$E_FIXTURE") missed+=("$part") ;;
+      "$E_AMBER") ambered+=("$part") ;;
       # A provider whose credentials are red is a config problem, not a regression, and the
       # call tests would only fail for the same reason. Report config, do not report a
       # regression that is not there.
-      "$E_CONFIG") rc=$E_CONFIG
+      "$E_CONFIG") config=1
                    # Only the credential check implies the call tests would fail too.
                    # A chat route with no MCP URLs says nothing about telephony.
                    [ "$part" = creds ] && { note "provider config red, skipping the call tests"
-                                            skip+="outbound inbound "; } ;;
-      *) failed+=("$part"); rc=$E_FAIL
+                                            skip+="outbound inbound $calls"; } ;;
+      *) failed+=("$part")
          # The browser walk reads the run the text part creates; without one it has nothing
          # to assert and would only re-report the same failure.
          [ "$part" = text ] && skip+="browser " ;;
     esac
   done
 
-  touched 'red.?team' && { attempt cmd_redteam || { failed+=(redteam); rc=$E_FAIL; }; }
-  touched 'uptime'    && { attempt cmd_uptime  || { failed+=(uptime);  rc=$E_FAIL; }; }
+  touched 'red.?team' && { attempt cmd_redteam || failed+=(redteam); }
+  touched 'uptime'    && { attempt cmd_uptime  || failed+=(uptime); }
 
-  printf '\n%s in %ss\n' "$([ $rc = 0 ] && echo PASS || echo "FAIL: ${failed[*]:-config}")" $((SECONDS - t0))
+  # Worst first: a regression outranks rotted fixtures, which outrank red credentials.
+  local line=PASS
+  if [ ${#failed[@]} -gt 0 ]; then rc=$E_FAIL line="FAIL: ${failed[*]}"
+  elif [ ${#missed[@]} -gt 0 ]; then rc=$E_FIXTURE line="MISS: ${missed[*]}"
+  elif [ -n "$config" ]; then rc=$E_CONFIG line="FAIL: config"
+  elif [ ${#ambered[@]} -gt 0 ]; then rc=$E_AMBER line="AMBER: ${ambered[*]}"
+  fi
+  printf '\n%s in %ss\n' "$line" $((SECONDS - t0))
   exit $rc
 }
 
@@ -502,6 +552,8 @@ cmd_selftest() {
   chk SYSTEM_ERROR       "$(verdict SYSTEM_ERROR)"       red
   chk OUT_OF_FUNDS       "$(verdict OUT_OF_FUNDS)"       red
   chk STUCK              "$(verdict STUCK_IN_QUEUED)"    red
+  chk QUEUED             "$(verdict QUEUED)"             pending
+  chk READY              "$(verdict READY)"              pending
 
   # amber retries exactly once, then hardens to a failure
   local n=0
@@ -509,6 +561,8 @@ cmd_selftest() {
   red()   { n=$((n + 1)); return $E_FAIL; }
   attempt amber; chk "amber rc" "$?" "$E_FAIL"; chk "amber tries" "$n" 2
   n=0; attempt red; chk "red rc" "$?" "$E_FAIL"; chk "red tries" "$n" 1
+  n=0; SUITE_DAILY=1 attempt amber; chk "daily amber rc" "$?" "$E_AMBER"; chk "daily amber tries" "$n" 2
+  chk "provider parts" "$(TEST_SUITE_PROVIDERS='[{"name":"vapi"},{"name":"retell"}]' provider_parts | tr '\n' ' ')" "call:vapi call:retell "
 
   [ $f = 0 ] && ok selftest "classifier and retry rule" || return $E_FAIL
 }
@@ -516,7 +570,7 @@ cmd_selftest() {
 case "${1:-}" in
   run)       shift; cmd_run "$@" ;;
   selftest)  cmd_selftest ;;
-  preflight|sha|creds|signup|text|sms|traces|browser|bluejayai|outbound|inbound|redteam|uptime)
+  preflight|sha|creds|signup|text|webchat|sms|traces|browser|bluejayai|outbound|inbound|redteam|uptime|call)
              p=$1; shift; FE=${FE%/}; API=${API%/}; "cmd_$p" "$@" ;;
   *)         sed -n '2,8p' "$0"; exit $E_USAGE ;;
 esac

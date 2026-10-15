@@ -1,4 +1,4 @@
-// Onboarding half of the nightly: can a brand new account get from nothing to inside an
+// Onboarding half of the daily: can a brand new account get from nothing to inside an
 // organization. This is the path the ENG-544 release broke on 2026-09-02, and nothing
 // else in the suite touches it, because every other part signs in as a fixture user that
 // already has an org.
@@ -9,7 +9,7 @@
 //
 // It does NOT complete the public sign-up form. Turnstile gates the submit button on any
 // deployment with NEXT_PUBLIC_TURNSTILE_SITE_KEY set, and a headless browser cannot solve
-// it. Pretending otherwise would give a green nightly that proves nothing. So the form is
+// it. Pretending otherwise would give a green daily that proves nothing. So the form is
 // asserted as far as it renders, and the part a captcha does not protect, everything
 // after the account exists, is driven with a real new account instead.
 import { chromium } from "playwright";
