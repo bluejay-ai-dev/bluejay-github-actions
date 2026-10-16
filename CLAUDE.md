@@ -21,6 +21,7 @@ manifest and nothing external in the merge path.
 | `pr-checks.yml` | `workflow_call` | ticket gate, sibling gate, build, deterministic checks |
 | `enqueue.yml` | manual | merges a whole ticket in order, or nothing |
 | `hotfix.yml` | manual | one PR straight to main, for incidents, still needs green checks |
+| `captcha-probe.yml` | every 5 min | pages when prod Supabase rejects its own captcha secret (`bin/captcha-probe.py`), resolves on the next healthy run |
 | `nightly.yml` | manual only | runs the suite against prod. The 09:00 UTC schedule is commented out until `TEST_SUITE_*` exists, because a run with no fixtures dies at preflight and a workflow that goes red every morning teaches people to ignore red |
 
 ## Scripts
