@@ -1,0 +1,24 @@
+# Pages when prod Supabase rejects its own Turnstile secret, which blocks every email sign up
+# and sign in. See bin/captcha-probe.py. Resolves the page on the next healthy run.
+name: captcha-probe
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # GitHub can run scheduled jobs late, so expect 5 to 15 min
+  workflow_dispatch:
+
+concurrency:
+  group: captcha-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe prod auth captcha
+        env:
+          ROUTING_KEY: ${{ secrets.CAPTCHA_PAGERDUTY_ROUTING_KEY }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 bin/captcha-probe.py
