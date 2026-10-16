@@ -1,0 +1,24 @@
+bin/captcha-probe.py
+  s_e96b358e759c41::t_7bbe719ba3c307 1-48,51-85
+  s_e96b358e759c41::t_ef03991b309d83 49-50
+.github/workflows/captcha-probe.yml
+  s_e96b358e759c41::t_d38b91637adc4b 1-24
+CLAUDE.md
+  s_e96b358e759c41::t_ef03991b309d83 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "8280259e88a94c5f3b1889a496d8906ba70d1924",
+  "prompts": {},
+  "sessions": {
+    "s_e96b358e759c41": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "740036d2-e50c-41d0-8cff-b98c67c86e52",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Lorenzo Taylor <lmtaylor9@dons.usfca.edu>"
+    }
+  }
+}
