@@ -64,6 +64,7 @@ c_video() {
   local id repos="" d
   id=$(ticket_id)
   [ -n "$id" ] || skip "no ticket id in the title"
+  case "${TITLE:-}" in *--nv*) skip "marked --nv, no video required" ;; esac
   [ "${ADDITIONS:-0}" -gt 100 ] || skip "${ADDITIONS:-0} additions, under 100, no video required"
   repos=$(ticket_repos "$id") || repos=" ${GITHUB_REPOSITORY##*/}"
   has_frontend "$repos" || skip "no frontend repo on $id (${repos# }), no video required"
