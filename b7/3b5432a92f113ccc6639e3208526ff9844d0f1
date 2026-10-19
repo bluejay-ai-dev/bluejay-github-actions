@@ -1,0 +1,26 @@
+.github/workflows/daily.yml
+  s_e96b358e759c41::t_97f76068eb3936 3-4,8
+  s_e96b358e759c41::t_8502f61c9e110d 13-14,126-127,137,141-142
+bin/DAILY_FIXTURES.md
+  s_e96b358e759c41::t_97f76068eb3936 15-17
+bin/signup.mjs
+  s_e96b358e759c41::t_5d2dcdd17282e9 1,7-16,18-19,23-25,27-30,32,34-38,40-54,57-73,75-77,80-86,88-96,98-102,104,107-110,113,115
+CLAUDE.md
+  s_e96b358e759c41::t_8502f61c9e110d 24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "b73b5432a92f113ccc6639e3208526ff9844d0f1",
+  "prompts": {},
+  "sessions": {
+    "s_e96b358e759c41": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "740036d2-e50c-41d0-8cff-b98c67c86e52",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Lorenzo Taylor <lmtaylor9@dons.usfca.edu>"
+    }
+  }
+}
