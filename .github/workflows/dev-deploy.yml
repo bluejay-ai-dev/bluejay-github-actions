@@ -1,0 +1,66 @@
+name: deploy-to-dev
+on:
+  workflow_dispatch:
+    inputs:
+      ticket:
+        description: ENG-123
+        required: true
+      confirm:
+        description: type "i and my reviewer have both tested this"
+        required: true
+
+env:
+  ORG: bluejay-ai-dev
+  PHRASE: i and my reviewer have both tested this
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: token
+        with:
+          app-id: ${{ vars.DEPLOY_APP_ID }}
+          private-key: ${{ secrets.DEPLOY_APP_KEY }}
+          owner: bluejay-ai-dev
+
+      - env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          typed=$(tr '[:upper:]' '[:lower:]' <<<"$CONFIRM" | xargs)
+          if [ "$typed" != "$PHRASE" ]; then
+            echo "type exactly: $PHRASE"
+            exit 1
+          fi
+
+      - env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          ID: ${{ inputs.ticket }}
+        run: |
+          set -euo pipefail
+          gh search prs --owner "$ORG" --match title "$ID" --state open --json repository,number,title \
+            -q ".[] | select(.title | test(\"\\\\b$ID\\\\b\";\"i\")) | \"\(.repository.name) \(.number)\"" > prs.txt
+          if [ ! -s prs.txt ]; then
+            echo "no open PRs for $ID"
+            exit 1
+          fi
+          cat prs.txt >> "$GITHUB_STEP_SUMMARY"
+
+          while read -r repo num; do
+            read -r review state draft bad <<<"$(gh pr view "$num" -R "$ORG/$repo" \
+              --json reviewDecision,mergeable,isDraft,statusCheckRollup \
+              -q '[((.reviewDecision // "") | if . == "" then "NONE" else . end),
+                   .mergeable,
+                   (.isDraft|tostring),
+                   ([.statusCheckRollup[] | select(.conclusion != null and (.conclusion | IN("SUCCESS","NEUTRAL","SKIPPED") | not))] | length | tostring)] | @tsv')"
+            echo "$repo#$num review=$review mergeable=$state draft=$draft failing=$bad" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$review" != APPROVED ] || [ "$state" != MERGEABLE ] || [ "$draft" != false ] || [ "$bad" != 0 ]; then
+              exit 1
+            fi
+          done < prs.txt
+
+          while read -r repo num; do
+            sha=$(gh pr view "$num" -R "$ORG/$repo" --json headRefOid -q .headRefOid)
+            gh api -X PUT "repos/$ORG/$repo/pulls/$num/merge" -f sha="$sha" -f merge_method=squash
+            echo "merged $repo#$num" >> "$GITHUB_STEP_SUMMARY"
+          done < prs.txt
