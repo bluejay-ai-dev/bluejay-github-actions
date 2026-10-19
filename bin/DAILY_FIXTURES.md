@@ -12,8 +12,9 @@ when one is missing. All commands take `-R bluejay-ai-dev/bluejay-github-actions
    read another's traces.
 3. **Fixture user.** A user that is a member of org A and no other org. A second
    membership lands sign-in on the org picker, and browser and bluejayai end as `fixture`. Sign-in goes through a service-role
-   magic link, so no password is needed. signup.mjs makes and deletes its own throwaway
-   account at `gate+signup-*@bluejaysims.com` each run.
+   magic link, so no password is needed. signup.mjs makes, onboards and deletes its own throwaway
+   account at `watchdog-signup+<ts>@example.com` each run. It needs one `allowed_signups` row,
+   `watchdog-signup@example.com`, or the signup gate blocks every run after the first.
 4. **Text agent and sim.** A TEXT agent with `http_webhook` set to the hosted echo, plus a
    simulation with one digital human and at least one metric.
 5. **Webchat agent and sim.** A TEXT agent with connection type `OPENAI_CHAT`

@@ -1,19 +1,17 @@
 # Daily health check against prod.
 #
-# The promotion gate runs the same suite.sh before a release. This runs it after, on a
-# schedule, because the failure that started this ran green through every check and still
+# The promotion gate runs the same suite.sh before a release. This runs it after, started by
+# watchdog-service each morning, because the failure that started this ran green through every check and still
 # took sign-in down: the release was fine, the ORDER it reached prod in was not. Nothing
 # that inspects a pull request can see that. Only something that talks to prod can.
 #
-# It pages on red and stays quiet on amber, because a daily that cries about a carrier
+# watchdog-service pages on red and stays quiet on amber, because a daily that cries about a carrier
 # dropping one call is a daily people mute, and a muted daily is worse than none.
 name: daily
 
 on:
-  # Missing fixtures end the run as verdict "fixture", which never pages. bin/DAILY_FIXTURES.md
-  # lists what has to exist.
-  schedule:
-    - cron: '30 15 * * *'  # 15:30 UTC = 8:30 AM PDT (7:30 AM PST)
+  # watchdog-service starts this at 8:30 AM Pacific and pages on a failed run, so only a red
+  # verdict fails it. Missing fixtures end as "fixture"; bin/DAILY_FIXTURES.md lists them.
   workflow_dispatch:
     inputs:
       parts:
@@ -125,7 +123,8 @@ jobs:
             grep -E '^(ok|FAIL|MISS|AMBER|PASS)' /tmp/out
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          exit $rc
+          # only a regression fails the run: watchdog-service pages on a failed run
+          [ "$v" = red ] && exit 1 || exit 0
 
       - name: Keep the evidence
         if: always()
@@ -135,18 +134,9 @@ jobs:
           path: |
             /tmp/out
             /tmp/suite-*.png
+            /tmp/suite-signup-video
           if-no-files-found: ignore
           retention-days: 14
 
-      # Red triggers one PagerDuty incident (fixed dedup key), green resolves it. Amber,
-      # fixture and config only show in the run summary above.
-      - name: Page on red, resolve on green
-        if: always() && contains(fromJSON('["red", "green", ""]'), steps.run.outputs.verdict)
-        env:
-          VERDICT: ${{ steps.run.outputs.verdict }}
-          ROUTING_KEY: ${{ secrets.DAILY_PAGERDUTY_ROUTING_KEY }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: python3 bin/daily-page.py /tmp/out
-
-# No Slack job on purpose: PagerDuty is the one place a red daily goes. A person who
-# broke their own batch is DM'd by notify.sh rather than told in a channel.
+# No paging or Slack here: watchdog-service reads this run's result, pages on a failure and
+# posts the failure with its recording to #pagerduty-alerts.

@@ -21,7 +21,7 @@ manifest and nothing external in the merge path.
 | `pr-checks.yml` | `workflow_call` | ticket gate, sibling gate, build, deterministic checks |
 | `enqueue.yml` | manual | merges a whole ticket in order, or nothing |
 | `hotfix.yml` | manual | one PR straight to main, for incidents, still needs green checks |
-| `daily.yml` | 8:30 AM Pacific (15:30 UTC), manual | runs the suite against prod, one call per voice provider, pages on red and resolves on green. Missing fixtures end as `fixture` and never page; `bin/DAILY_FIXTURES.md` lists them |
+| `daily.yml` | started by watchdog-service at 8:30 AM Pacific, manual | runs the suite against prod, one call per voice provider. Only a red verdict fails the run, and watchdog-service pages on that. Missing fixtures end as `fixture`; `bin/DAILY_FIXTURES.md` lists them |
 
 ## Scripts
 
@@ -31,7 +31,6 @@ manifest and nothing external in the merge path.
 | `bin/gate.sh` | siblings, closure, and `order` (merge tiers from `.release/order.yml`) |
 | `bin/enqueue.sh` | readiness, tier ordering, squash merge, deploy waits, rollback |
 | `bin/suite.sh` | the integration suite, one subcommand per part |
-| `bin/daily-page.py` | PagerDuty trigger or resolve for the daily |
 | `bin/notify.sh` | DMs the authors on a ticket and moves it to Needs Prod Testing |
 | `bin/people.tsv` | github login to slack user id; a missing row falls back to the channel |
 | `bin/*.mjs` | playwright walks |
