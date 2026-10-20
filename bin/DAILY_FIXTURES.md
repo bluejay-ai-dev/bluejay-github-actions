@@ -1,8 +1,9 @@
 # Daily prod fixtures
 
-What a person has to create in prod and set on this repo before `daily.yml` goes green.
-`suite.sh preflight` checks every item below and ends the run as `fixture` (never paged)
-when one is missing. All commands take `-R bluejay-ai-dev/bluejay-github-actions`.
+watchdog-service runs `suite.sh` from this repo's main every morning at 8:30 AM Pacific and
+pages on a real regression. Its fixtures live in the watchdog-service Infisical project (prod),
+as the `DAILY_*` keys below. `suite.sh preflight` checks every item and ends the run as
+`fixture` (never paged) when one is missing.
 
 ## Prod data
 
@@ -36,43 +37,16 @@ when one is missing. All commands take `-R bluejay-ai-dev/bluejay-github-actions
     both), plus a key for every other provider in the list above that needs one.
 11. **PagerDuty.** An Events API v2 integration on the service that should be woken up.
 
-## Secrets
+## Infisical keys (watchdog-service, prod)
+
+`DAILY_BLUEJAY_API_KEY` (org A), `DAILY_BLUEJAY_API_KEY_B` (org B), `DAILY_USER_EMAIL`,
+`DAILY_SUPABASE_AUTH_URL` (https://auth.getbluejay.ai, so the session cookie gets the name the
+frontend reads), `DAILY_AGENT_ID`, `DAILY_SIM_TEXT`, `DAILY_SIM_WEBCHAT`, `DAILY_SIM_SMS`,
+`DAILY_SIM_INBOUND`, `DAILY_AGENT_INBOUND`, `DAILY_SIM_OUTBOUND`, `DAILY_AGENT_OUTBOUND` and
+`DAILY_PROVIDERS`, a JSON list with one lowercase entry per provider:
 
 ```
-gh secret set DAILY_BLUEJAY_API_KEY          # org A API key
-gh secret set DAILY_BLUEJAY_API_KEY_B        # org B API key
-gh secret set DAILY_USER_EMAIL               # fixture user's email
-gh secret set PROD_SUPABASE_URL
-gh secret set PROD_SUPABASE_ANON_KEY
-gh secret set PROD_SUPABASE_SERVICE_KEY
-gh secret set DAILY_PAGERDUTY_ROUTING_KEY    # Events API v2 routing key
+[{"name":"vapi","sim_id":"...","agent_id":"..."},{"name":"phone","sim_id":"...","agent_id":"..."}]
 ```
 
-## Variables
-
-```
-gh variable set PROD_FRONTEND_URL        # https://app.getbluejay.ai
-gh variable set PROD_API_URL             # prod middleware base URL
-gh variable set DAILY_AGENT_ID         # any org A agent id, read only
-gh variable set DAILY_SIM_TEXT         # item 4
-gh variable set DAILY_ECHO_URL         # the echo the text agent posts to
-gh variable set DAILY_SIM_WEBCHAT      # item 5
-gh variable set DAILY_SIM_SMS          # item 6
-gh variable set DAILY_SIM_OUTBOUND     # item 7
-gh variable set DAILY_AGENT_OUTBOUND
-gh variable set DAILY_SIM_INBOUND      # item 8
-gh variable set DAILY_AGENT_INBOUND
-gh variable set DAILY_PROVIDERS        # item 9, see below
-```
-
-`DAILY_PROVIDERS` is a JSON list with one entry per provider. Names are lowercase and
-appear in the page title as "vapi call":
-
-```
-[{"name":"vapi","sim_id":"...","agent_id":"..."},{"name":"retell","sim_id":"...","agent_id":"..."}]
-```
-
-## Checking it
-
-Run the workflow by hand with `parts` = `preflight`. It lists the first missing item as a
-`MISS` line. Then run it with `parts` blank for a full run.
+Run one part by hand with the same keys: `infisical run --env=prod -- bin/suite.sh <part>`.

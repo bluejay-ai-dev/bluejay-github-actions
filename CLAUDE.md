@@ -9,7 +9,7 @@ a `gating-trial` label.
 Branch off `main` → one PR per repo, each titled `[ENG-123]` → `pr-checks` refuses to pass
 any of them until every sibling on that id is green → reviewer approves each → run
 `enqueue` with the ticket → it merges them all in dependency order or none of them →
-`daily` runs the suite against prod afterwards.
+watchdog-service runs the suite against prod every morning.
 
 The ticket id in the PR title is the only thing that groups PRs across repos. There is no
 manifest and nothing external in the merge path.
@@ -21,7 +21,6 @@ manifest and nothing external in the merge path.
 | `pr-checks.yml` | `workflow_call` | ticket gate, sibling gate, build, deterministic checks |
 | `enqueue.yml` | manual | merges a whole ticket in order, or nothing |
 | `hotfix.yml` | manual | one PR straight to main, for incidents, still needs green checks |
-| `daily.yml` | started by watchdog-service at 8:30 AM Pacific, manual | runs the suite against prod, one call per voice provider. Only a red verdict fails the run, and watchdog-service pages on that. Missing fixtures end as `fixture`; `bin/DAILY_FIXTURES.md` lists them |
 
 ## Scripts
 
