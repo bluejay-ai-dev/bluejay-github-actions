@@ -90,7 +90,7 @@ def run_sim(label, agent_body):
     api("create-digital-humans", {"simulation_ids": [int(sim_id)], "digital_humans": [{
         "name": "Smoke caller", "intent": "Ask whether order 1234 has shipped, then thank them and end the conversation.",
         "success_criteria": "The agent says whether order 1234 shipped."}]})
-    run = api("queue-simulation-run", {"simulation_id": str(sim_id)})
+    run = api("queue-http-text-simulation-run" if label == "chat" else "queue-simulation-run", {"simulation_id": str(sim_id)})
     run_id = run.get("simulation_run_id") or run.get("id")
     scid, seen, err, deadline = "", "", "", time.time() + 900
     while time.time() < deadline:
@@ -110,7 +110,7 @@ okey = mw_vars["OPENAI_API_KEY"]
 for label, body in (("chat", {"mode": "TEXT", "connection_type": "OPENAI_CHAT", "openai_base_url": "https://api.openai.com/v1",
                               "openai_api_key": okey, "openai_model": "gpt-4o-mini"}),
                     ("voice", {"mode": "VOICE", "connection_type": "OPENAI_REALTIME", "openai_api_key": okey,
-                               "openai_model": "gpt-4o-realtime-preview"})):
+                               "openai_model": "gpt-realtime"})):
     try:
         r = run_sim(label, body)
     except Exception as e:
