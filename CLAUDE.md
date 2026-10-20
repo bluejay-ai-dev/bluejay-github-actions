@@ -9,7 +9,7 @@ a `gating-trial` label.
 Branch off `main` → one PR per repo, each titled `[ENG-123]` → `pr-checks` refuses to pass
 any of them until every sibling on that id is green → reviewer approves each → run
 `enqueue` with the ticket → it merges them all in dependency order or none of them →
-`nightly` runs the suite against prod afterwards.
+watchdog-service runs the suite against prod every morning.
 
 The ticket id in the PR title is the only thing that groups PRs across repos. There is no
 manifest and nothing external in the merge path.
@@ -22,7 +22,6 @@ manifest and nothing external in the merge path.
 | `enqueue.yml` | manual | merges a whole ticket in order, or nothing |
 | `hotfix.yml` | manual | one PR straight to main, for incidents, still needs green checks |
 | `deploy-dev.yml` | `workflow_call` | force-pushes a branch onto the caller's `dev`, so `dev` has that branch's exact history and the dev deploys run |
-| `nightly.yml` | manual only | runs the suite against prod. The 09:00 UTC schedule is commented out until `TEST_SUITE_*` exists, because a run with no fixtures dies at preflight and a workflow that goes red every morning teaches people to ignore red |
 
 ## Scripts
 
@@ -106,8 +105,8 @@ which is `actions:write` on this repo only and cannot read anything else.
 - `INFISICAL_TOKEN` and `RAILWAY_TOKEN` are still unset. The build job skips the Infisical
   step when absent, so this degrades rather than breaking.
 - `suite.sh preflight` is the manifest for the suite's own fixtures and cannot drift from
-  the code. `TEST_SUITE_*` does not exist yet, which is why the nightly schedule is
-  commented out.
+  the code. The daily's prod fixtures are listed in `bin/DAILY_FIXTURES.md` and are not
+  set yet.
 - A GitHub App as the only bypass actor on the main ruleset, `MERGE_APP_ID` and
   `MERGE_APP_PRIVATE_KEY`. Without it `enqueue check` works and `enqueue run` cannot merge.
 - Neither middleware nor the frontend exposes a deployed SHA, so `suite.sh sha` exits 3

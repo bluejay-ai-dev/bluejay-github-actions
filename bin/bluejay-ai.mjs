@@ -20,8 +20,9 @@ const DEADLINE_MS = Number(process.env.BJAI_DEADLINE_MS ?? 300_000);
 const api = (path, init = {}) =>
   fetch(`${API}${path}`, { ...init, headers: { "X-API-Key": KEY, "Content-Type": "application/json" } });
 
+let listErr = null;
 const agents = async () =>
-  api("/v1/all-agents").then(r => (r.ok ? r.json() : [])).catch(() => []);
+  api("/v1/all-agents").then(r => { listErr = r.ok ? null : r.status; return r.ok ? r.json() : []; }).catch(() => []);
 const simsFor = async id =>
   api(`/v1/get-simulations-by-agent/${id}`).then(r => (r.ok ? r.json() : {})).catch(() => ({}));
 
@@ -33,7 +34,7 @@ let agentId = null;
 const cleanup = async () => {
   if (agentId) {
     const s = await simsFor(agentId);
-    for (const sim of s.simulations ?? s ?? []) {
+    for (const sim of s.simulations ?? []) {
       if (sim?.id) await api(`/v1/simulation/${sim.id}`, { method: "DELETE" }).catch(() => {});
     }
     await api(`/v1/agent/${agentId}`, { method: "DELETE" }).catch(() => {});
@@ -102,7 +103,7 @@ while (Date.now() < end) {
   if (found) {
     agentId = found.id;
     const s = await simsFor(agentId);
-    sims = (s.simulations ?? s ?? []).filter(x => (x?.name ?? "").startsWith(TOKEN));
+    sims = (s.simulations ?? []).filter(x => (x?.name ?? "").startsWith(TOKEN));
     if (sims.length >= 2) break;
   }
   await page.waitForTimeout(5000);
@@ -112,6 +113,9 @@ const replied = (await page.locator("body").innerText().catch(() => "")).length 
   && !(await page.locator("text=/something went wrong|failed to load/i").first().isVisible().catch(() => false));
 if (!replied) await fail("the assistant page fell over while working");
 
+// A broken list is a product failure, not a slow model, and it hides what the model made.
+if (!agentId && listErr)
+  await fail(`GET /v1/all-agents -> ${listErr}, so agent "${TOKEN}" and its sims could not be found or removed`);
 if (!agentId) {
   await browser.close().catch(() => {});
   console.error(`AMBER bluejay-ai: replied but never created agent "${TOKEN}".`);
