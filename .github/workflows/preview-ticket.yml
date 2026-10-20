@@ -171,12 +171,11 @@ jobs:
             br=$(gh pr list -R "$ORG/$r" --state open --search "$TICKET in:title" --limit 10 \
                  --json number,title,headRefName \
                  -q "first(.[] | select((.title | test(\"(^|[^A-Za-z0-9])$TICKET([^0-9]|\$)\";\"i\")) and ((.headRefName + .title) | contains(\"--np\") | not)) | .headRefName) // \"\"")
-            # Workers idle in preview-base and in every preview except the ones the ticket
-            # changed, so shared data never gets two schedulers (workers read PREVIEW_IDLE).
-            # A lambda-only ticket touches none of these and still gets an environment.
+            # Every preview has its own database, so its workers run whether or not the ticket
+            # touched them. A lambda-only ticket touches none of these and still gets an environment.
             # Untouched services build once at creation. A path no commit touches stops every
             # merge to main from rebuilding them in every preview and starving prod of build slots.
-            [ -n "$br" ] || { echo "$r: main (untouched)"; args+=(--service-config "$svc" variables.PREVIEW_IDLE.value 1 --service-config "$svc" build.watchPatterns '["/.preview-never-rebuild"]'); continue; }
+            [ -n "$br" ] || { echo "$r: main (untouched)"; args+=(--service-config "$svc" variables.PREVIEW_IDLE.value 0 --service-config "$svc" build.watchPatterns '["/.preview-never-rebuild"]'); continue; }
             echo "$r: $br"
             args+=(--service-config "$svc" source.branch "$br" --service-config "$svc" variables.PREVIEW_IDLE.value 0)
             touched="$touched $r"
