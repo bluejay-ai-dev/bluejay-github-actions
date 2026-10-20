@@ -43,9 +43,10 @@ async function cleanup() {
   if (!userId) return;
   const memberships = await rest("GET", `organization_memberships?user_id=eq.${userId}&select=organization_id`);
   for (const { organization_id: org } of memberships) {
-    for (const t of ["agents", "api_keys", "invites", "monthly_billing_usage", "support_access_sessions",
-                     "bluejay_bluebic_jobs", "workflows_v2"]) {
-      await rest("DELETE", `${t}?organization_id=eq.${org}`);
+    for (const t of ["agents", "api_keys", "invites", "monthly_billing_usage?customer_id",
+                     "support_access_sessions?target_organization_id", "bluejay_bluebic_jobs", "workflows_v2"]) {
+      const [table, col = "organization_id"] = t.split("?");
+      await rest("DELETE", `${table}?${col}=eq.${org}`);
     }
     await rest("DELETE", `organizations?id=eq.${org}`);
   }
