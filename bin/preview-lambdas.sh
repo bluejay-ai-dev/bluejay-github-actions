@@ -52,14 +52,18 @@ while IFS=: read -r kind image_from cfg_from var; do
   [ -z "$sm" ] || extra=$(aws secretsmanager get-secret-value --secret-id "$sm" --query SecretString --output text)
   # Secrets Manager would override the preview's database at startup, so fold it in and drop the link
   jq -c --argjson x "$extra" --arg db "$db" --arg sb "$supabase" --arg sk "$svckey" --arg mw "$mw" \
-        --arg n "$notif_url" --arg m "https://sqs.$AWS_REGION.amazonaws.com/$acct/SandboxUsageMeteringQueue" '
+        --arg n "$notif_url" --arg m "https://sqs.$AWS_REGION.amazonaws.com/$acct/SandboxUsageMeteringQueue" \
+        --arg lk "${LK_API_KEY:-}" --arg lks "${LK_API_SECRET:-}" --arg rb "${REC_BUCKET:-}" '
     {Variables: ((.Environment.Variables // {}) + $x | del(.SECRETS_MANAGER_SECRET_ID, .SECRETS_ROTATED_AT)
       | if .DATABASE_URL then .DATABASE_URL = ((.DATABASE_URL|split("://")[0]) + "://" + ($db|split("://")[1])) else . end
       | if .SUPABASE_URL then .SUPABASE_URL = $sb else . end
       | if .SUPABASE_SERVICE_KEY then .SUPABASE_SERVICE_KEY = $sk else . end
       | if .MIDDLEWARE_URL then .MIDDLEWARE_URL = $mw else . end
       | if .SQS_NOTIFICATION_QUEUE_URL then .SQS_NOTIFICATION_QUEUE_URL = $n else . end
-      | if .METRONOME_SQS_QUEUE_URL then .METRONOME_SQS_QUEUE_URL = $m else . end)}' <<<"$cfg" > /tmp/env-$kind.json
+      | if .METRONOME_SQS_QUEUE_URL then .METRONOME_SQS_QUEUE_URL = $m else . end
+      # sandbox's LiveKit key is rejected, and the preview's workers record to their own bucket
+      | if .LIVEKIT_API_KEY and $lk != "" then .LIVEKIT_API_KEY = $lk | .LIVEKIT_API_SECRET = $lks else . end
+      | if .TRANSCRIPT_S3_BUCKET_NAME and $rb != "" then .TRANSCRIPT_S3_BUCKET_NAME = $rb else . end)}' <<<"$cfg" > /tmp/env-$kind.json
 
   if aws lambda get-function --function-name "$fn" >/dev/null 2>&1; then
     aws lambda update-function-code --function-name "$fn" --image-uri "$image" >/dev/null

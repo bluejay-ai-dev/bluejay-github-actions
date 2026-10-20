@@ -250,6 +250,12 @@ jobs:
             kind=$base; [ "$base" = livekit_dispatcher ] && kind=dispatcher
             pr_fns="$pr_fns $kind:pr${n}_$base"; echo "$lr: pr${n}_$base"
           done
+          # the lambdas have to match the workers: same LiveKit key, same recordings bucket
+          lkv=$(railway variables -s lk-outbound -e "$BASE_ENV" --json)
+          LK_API_KEY=$(jq -r '.LIVEKIT_API_KEY // empty' <<<"$lkv"); LK_API_SECRET=$(jq -r '.LIVEKIT_API_SECRET // empty' <<<"$lkv")
+          REC_BUCKET=$(jq -r '.TRANSCRIPT_S3_BUCKET_NAME // empty' <<<"$lkv")
+          echo "::add-mask::$LK_API_KEY"; echo "::add-mask::$LK_API_SECRET"
+          export LK_API_KEY LK_API_SECRET REC_BUCKET
           PR_FUNCTIONS="$pr_fns" .gating/bin/preview-lambdas.sh up "$ENV_NAME" \
             "postgres://postgres.$bref:$pw@$PREVIEW_PG_HOST:5432/postgres" "https://$bref.supabase.co" "$svckey" \
             "https://middleware-$ENV_NAME.up.railway.app" >/dev/null \
