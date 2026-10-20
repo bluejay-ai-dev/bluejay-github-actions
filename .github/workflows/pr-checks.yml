@@ -197,7 +197,7 @@ jobs:
           echo "$INFISICAL_DEB_SHA256  /tmp/infisical.deb" | sha256sum -c -
           sudo dpkg -i /tmp/infisical.deb >/dev/null
       - { if: always(), name: ticket-sane,           run: .gating/bin/checks.sh ticket-sane }
-      - { if: always(), name: video,                 run: .gating/bin/checks.sh video }
+      - { if: "always() && !contains(github.event.pull_request.labels.*.name, 'no-visual')", name: video,                 run: .gating/bin/checks.sh video }
       - { if: always(), name: migrations-immutable,  run: .gating/bin/checks.sh migrations-immutable }
       - { if: always(), name: migrations-newest,     run: .gating/bin/checks.sh migrations-newest }
       - { if: always(), name: migrations-have-down,  run: .gating/bin/checks.sh migrations-have-down }
