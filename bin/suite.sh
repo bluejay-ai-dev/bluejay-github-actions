@@ -62,7 +62,7 @@ verdict() {
   esac
 }
 
-# error_code lives on test_results but is not on the REST response yet, so classify on
+# error_code lives on sim_conversations but is not on the REST response yet, so classify on
 # status. Every AUTH/MISSING/DECRYPT/BRIDGE code lands on NO_CONNECTION anyway; the code
 # is only ever extra detail in the failure line.
 result_of() {
@@ -289,7 +289,7 @@ cmd_sms() {
 }
 
 # Assert the ingest pipeline directly rather than as a side effect of a sim: livekit_agent
-# emits no spans of its own and test_results.trace_ids is customer supplied, so a sim proves
+# emits no spans of its own and sim_conversations.trace_ids is customer supplied, so a sim proves
 # nothing about traces. This is faster, deterministic, and tests the thing that breaks.
 cmd_traces() {
   local seed=${SUITE_EXPECT_SHA:-$(date +%s)}${SUITE_ATTEMPT:-1}
@@ -345,7 +345,7 @@ PY
   [ "$code" = 404 ] || { bad traces "second org got HTTP $code on the same trace, expected 404"; return $E_FAIL; }
 
   # Read-path smoke only: the list narrows to trace ids reachable from obs_conversations
-  # and test_results, so a synthetic trace never appears in it.
+  # and sim_conversations, so a synthetic trace never appears in it.
   code=$(call GET "/v1/traces?limit=5")
   [ "$code" = 200 ] || { bad traces "list endpoint -> $code"; return $E_FAIL; }
   ok traces "3 spans, links intact, tags stripped, cross-org 404"

@@ -1,0 +1,70 @@
+name: deploy-dev
+
+# Points the caller's `dev` at a branch, history and all, so that repo's existing
+# push-to-dev deploys run: the Railway dev services, the dev Lambdas, dev migrations.
+#
+# A force push, never a merge. dev is a copy of whatever was deployed last, so it never
+# drifts from main by more than that branch does. Commits only on dev are dropped; the
+# summary keeps the old sha so they can be restored.
+#
+# DEV_SYNC_TOKEN is required. GITHUB_TOKEN cannot push a change under .github/workflows,
+# and its pushes start no other workflow, so the Lambda deploys on dev would never run.
+# It needs Contents and Workflows write on the caller repo.
+
+on:
+  workflow_call:
+    inputs:
+      branch: { required: true, type: string }
+    secrets:
+      DEV_SYNC_TOKEN: { required: false }
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BRANCH: ${{ inputs.branch }}
+      HAS_SYNC_TOKEN: ${{ secrets.DEV_SYNC_TOKEN != '' }}
+    steps:
+      - name: Validate
+        run: |
+          set -euo pipefail
+          [ "$HAS_SYNC_TOKEN" = true ] || { echo "::error::DEV_SYNC_TOKEN is not set, so nothing was deployed"; exit 1; }
+          git check-ref-format --branch "$BRANCH" >/dev/null || { echo "::error::not a branch name: $BRANCH"; exit 2; }
+          [ "$BRANCH" != dev ] || { echo "::error::pick the branch to deploy, not dev"; exit 2; }
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.DEV_SYNC_TOKEN }}
+
+      - name: Point dev at the branch
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse --verify -q "origin/$BRANCH^{commit}") || { echo "::error::$BRANCH does not exist on $REPO"; exit 2; }
+          before=$(git rev-parse --verify -q origin/dev || echo none)
+          if [ "$before" = "$sha" ]; then
+            echo "dev is already at $BRANCH, nothing to deploy"
+            echo "### dev is already at \`$BRANCH\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! out=$(git push --force origin "$sha:refs/heads/dev" 2>&1); then
+            echo "$out"
+            if grep -qE 'GH013|GH006|protected branch' <<<"$out"; then
+              echo "::error::a branch rule on dev blocks force pushes. Allow them for DEV_SYNC_TOKEN's owner."
+            else
+              echo "::error::could not push dev"
+            fi
+            exit 1
+          fi
+          echo "$out"
+          {
+            echo "### Deployed \`$BRANCH\` to dev"
+            echo "dev was \`$before\`, now \`$sha\`. To restore it, push the old sha to dev."
+          } >> "$GITHUB_STEP_SUMMARY"

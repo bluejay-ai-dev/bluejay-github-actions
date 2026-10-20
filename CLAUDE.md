@@ -21,6 +21,7 @@ manifest and nothing external in the merge path.
 | `pr-checks.yml` | `workflow_call` | ticket gate, sibling gate, build, deterministic checks |
 | `enqueue.yml` | manual | merges a whole ticket in order, or nothing |
 | `hotfix.yml` | manual | one PR straight to main, for incidents, still needs green checks |
+| `deploy-dev.yml` | `workflow_call` | force-pushes a branch onto the caller's `dev`, so `dev` has that branch's exact history and the dev deploys run |
 
 ## Scripts
 
