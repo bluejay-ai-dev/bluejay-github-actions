@@ -34,7 +34,7 @@ let agentId = null;
 const cleanup = async () => {
   if (agentId) {
     const s = await simsFor(agentId);
-    for (const sim of s.simulations ?? s ?? []) {
+    for (const sim of s.simulations ?? []) {
       if (sim?.id) await api(`/v1/simulation/${sim.id}`, { method: "DELETE" }).catch(() => {});
     }
     await api(`/v1/agent/${agentId}`, { method: "DELETE" }).catch(() => {});
@@ -103,7 +103,7 @@ while (Date.now() < end) {
   if (found) {
     agentId = found.id;
     const s = await simsFor(agentId);
-    sims = (s.simulations ?? s ?? []).filter(x => (x?.name ?? "").startsWith(TOKEN));
+    sims = (s.simulations ?? []).filter(x => (x?.name ?? "").startsWith(TOKEN));
     if (sims.length >= 2) break;
   }
   await page.waitForTimeout(5000);
