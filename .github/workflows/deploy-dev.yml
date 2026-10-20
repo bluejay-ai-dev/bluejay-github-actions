@@ -30,22 +30,28 @@ jobs:
       HAS_SYNC_TOKEN: ${{ secrets.DEV_SYNC_TOKEN != '' }}
     steps:
       - name: Validate
+        env:
+          DEV_SYNC_TOKEN: ${{ secrets.DEV_SYNC_TOKEN }}
         run: |
           set -euo pipefail
           [ "$HAS_SYNC_TOKEN" = true ] || { echo "::error::DEV_SYNC_TOKEN is not set, so nothing was deployed"; exit 1; }
+          [ "${#DEV_SYNC_TOKEN}" -ge 40 ] || { echo "::error::DEV_SYNC_TOKEN looks too short; set a real fine-grained PAT in Infisical and re-sync repo secrets"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${DEV_SYNC_TOKEN}" "https://api.github.com/repos/${{ github.repository }}")
+          [ "$code" = "200" ] || { echo "::error::DEV_SYNC_TOKEN cannot read this repo (GitHub API HTTP ${code})"; exit 1; }
           git check-ref-format --branch "$BRANCH" >/dev/null || { echo "::error::not a branch name: $BRANCH"; exit 2; }
           [ "$BRANCH" != dev ] || { echo "::error::pick the branch to deploy, not dev"; exit 2; }
 
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.DEV_SYNC_TOKEN }}
 
       - name: Point dev at the branch
         env:
           REPO: ${{ github.repository }}
+          DEV_SYNC_TOKEN: ${{ secrets.DEV_SYNC_TOKEN }}
         run: |
           set -euo pipefail
+          git remote set-url origin "https://x-access-token:${DEV_SYNC_TOKEN}@github.com/${REPO}.git"
           sha=$(git rev-parse --verify -q "origin/$BRANCH^{commit}") || { echo "::error::$BRANCH does not exist on $REPO"; exit 2; }
           before=$(git rev-parse --verify -q origin/dev || echo none)
           if [ "$before" = "$sha" ]; then
