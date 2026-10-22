@@ -1,0 +1,255 @@
+name: Deploy to ECS
+
+# Reusable deploy for one service on the bluejay ECS cluster (bluejay_infra, ENG-1542):
+#   terraform (caller's infra dir) -> build arm64 image -> roll the service, or repoint its schedule.
+# The ECS circuit breaker rolls a failed rollout back by itself; this run then fails.
+# Callers pass `secrets: inherit` so the module source (private bluejay_infra) can be fetched
+# with the org's merge app token.
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: 'Module name: ECR bluejay/<service>, ECS service and task family <service>-<env>'
+        type: string
+        required: true
+      env:
+        type: string
+        default: poc
+      aws_role_arn:
+        description: 'arn:aws:iam::148660429236:role/bluejay-deploy-<repo>'
+        type: string
+        required: true
+      dockerfile:
+        type: string
+        default: Dockerfile
+      context:
+        description: 'Docker build context'
+        type: string
+        default: .
+      build_args:
+        description: 'Newline-separated KEY=VALUE docker build args'
+        type: string
+        default: ''
+      infra_dir:
+        type: string
+        default: infra
+      tf_var_file:
+        description: 'Optional -var-file, relative to infra_dir'
+        type: string
+        default: ''
+      container:
+        description: 'Container name in the task definition. Blank means service.'
+        type: string
+        default: ''
+      runner:
+        description: 'Build runner. A non-ARM runner builds under QEMU.'
+        type: string
+        default: ubuntu-24.04-arm
+      terraform_version:
+        type: string
+        default: 1.15.8
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-west-1
+  ECS_CLUSTER: bluejay
+
+concurrency:
+  group: deploy-ecs-${{ github.repository }}-${{ inputs.service }}-${{ inputs.env }}
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Token to read bluejay_infra modules
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.MERGE_APP_ID }}
+          private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
+          owner: bluejay-ai-dev
+          repositories: bluejay_infra
+          permission-contents: read
+
+      - name: Let git fetch bluejay_infra
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+        run: git config --global url."https://x-access-token:${TOKEN}@github.com/bluejay-ai-dev/".insteadOf "https://github.com/bluejay-ai-dev/"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Terraform init
+        working-directory: ${{ inputs.infra_dir }}
+        run: terraform init -input=false -no-color
+
+      - name: Terraform apply
+        working-directory: ${{ inputs.infra_dir }}
+        env:
+          VAR_FILE: ${{ inputs.tf_var_file }}
+        run: |
+          set -o pipefail
+          args=(-input=false -auto-approve -no-color)
+          [ -z "$VAR_FILE" ] || args+=("-var-file=$VAR_FILE")
+          terraform apply "${args[@]}" | tee apply.log
+          echo "**terraform:** $(grep -E '^Apply complete!' apply.log || echo 'no summary line')" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: terraform
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      image: ${{ steps.tags.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Image tags
+        id: tags
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SERVICE: ${{ inputs.service }}
+          ENV_NAME: ${{ inputs.env }}
+        run: |
+          repo="$REGISTRY/bluejay/$SERVICE"
+          echo "image=$repo:$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          { echo 'tags<<EOF'; echo "$repo:$GITHUB_SHA"; echo "$repo:$ENV_NAME"; echo EOF; } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (non-ARM runner only)
+        if: runner.arch != 'ARM64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: ${{ inputs.build_args }}
+          cache-from: type=gha,scope=${{ inputs.service }}-${{ inputs.env }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}-${{ inputs.env }}
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+          ARCH: ${{ runner.arch }}
+        run: echo "**build:** \`$IMAGE\` on a $ARCH runner" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.aws_role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # the newest revision carries whatever Terraform last set; only the image changes
+      - name: Register a revision with the new image
+        id: register
+        env:
+          FAMILY: ${{ inputs.service }}-${{ inputs.env }}
+          CONTAINER: ${{ inputs.container || inputs.service }}
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$FAMILY" --include TAGS \
+            | jq --arg image "$IMAGE" --arg container "$CONTAINER" '
+                (.tags // []) as $tags
+                | .taskDefinition
+                | (.containerDefinitions[] | select(.name == $container) | .image) = $image
+                | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+                      .registeredAt, .registeredBy, .deregisteredAt)
+                | if ($tags | length) > 0 then . + {tags: $tags} else . end' > td.json
+          grep -q "$IMAGE" td.json || { echo "::error::no container named $CONTAINER in $FAMILY"; exit 1; }
+          arn=$(aws ecs register-task-definition --cli-input-json file://td.json --query taskDefinition.taskDefinitionArn --output text)
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+          echo "**registered:** \`${arn##*/}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Roll the service, or repoint the schedule
+        env:
+          NAME: ${{ inputs.service }}-${{ inputs.env }}
+          TARGET: ${{ steps.register.outputs.arn }}
+        run: |
+          set -euo pipefail
+          status=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$NAME" --query 'services[0].status' --output text 2>/dev/null || true)
+          if [ "$status" != ACTIVE ]; then
+            schedule="bluejay-$NAME"
+            aws scheduler get-schedule --name "$schedule" > schedule.json || { echo "::error::$NAME is neither an ECS service nor schedule $schedule"; exit 1; }
+            jq --arg td "$TARGET" '.Target.EcsParameters.TaskDefinitionArn = $td
+              | del(.Arn, .CreationDate, .LastModificationDate)' schedule.json > update.json
+            aws scheduler update-schedule --cli-input-json file://update.json > /dev/null
+            echo "**schedule:** \`$schedule\` now runs \`${TARGET##*/}\` ($(jq -r .State schedule.json))" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$NAME" --task-definition "$TARGET" > /dev/null
+          deadline=$(( $(date +%s) + 1200 ))
+          while :; do
+            deployment=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$NAME" \
+              --query "services[0].deployments[?taskDefinition=='$TARGET'] | [0]" --output json)
+            state=$(jq -r 'if . == null then "GONE" else .rolloutState end' <<<"$deployment")
+            case "$state" in
+              COMPLETED) break ;;
+              FAILED) echo "::error::circuit breaker rolled back ${TARGET##*/}: $(jq -r .rolloutStateReason <<<"$deployment")"; exit 1 ;;
+              GONE) echo "::error::${TARGET##*/} was replaced or rolled back"; exit 1 ;;
+            esac
+            [ "$(date +%s)" -lt "$deadline" ] || { echo "::error::rollout still $state after 20 min"; exit 1; }
+            echo "rollout $state ($(jq -r '"\(.runningCount)/\(.desiredCount) running"' <<<"$deployment"))"
+            sleep 15
+          done
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$NAME"
+          echo "**service:** \`$NAME\` stable on \`${TARGET##*/}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show what ECS said
+        if: failure()
+        env:
+          NAME: ${{ inputs.service }}-${{ inputs.env }}
+        run: |
+          {
+            echo "### ECS service events (newest first)"
+            echo '```'
+            aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$NAME" \
+              --query 'services[0].events[:10].[createdAt, message]' --output text || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tell Slack the deploy failed
+        if: failure()
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.DEPLOY_ALERTS_SLACK_CHANNEL }}
+          NAME: ${{ inputs.service }}-${{ inputs.env }}
+        run: |
+          [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${SLACK_CHANNEL:-}" ] || { echo "::warning::Slack not configured"; exit 0; }
+          text=":x: ECS deploy of $NAME failed. $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          curl -sS --max-time 20 https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H 'Content-type: application/json; charset=utf-8' \
+            -d "$(jq -nc --arg c "$SLACK_CHANNEL" --arg t "$text" '{channel:$c,text:$t}')" > /dev/null || true
