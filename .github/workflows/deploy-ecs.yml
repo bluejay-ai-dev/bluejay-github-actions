@@ -76,6 +76,7 @@ jobs:
           private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
           owner: bluejay-ai-dev
           repositories: bluejay_infra
+          permission-contents: read
 
       - name: Let git fetch bluejay_infra
         env:
