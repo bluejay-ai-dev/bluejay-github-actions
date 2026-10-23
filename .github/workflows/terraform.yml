@@ -1,0 +1,188 @@
+name: terraform
+
+# fmt and validate on every event, a plan per environment on PRs, apply on main.
+# The plan role is read-only and trusts the pull_request OIDC subject. The apply role
+# trusts only refs/heads/main.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory: { required: false, type: string, default: infra/terraform }
+      terraform_version: { required: false, type: string, default: 1.11.4 }
+      aws_region: { required: false, type: string, default: us-west-1 }
+      environments: { required: true, type: string }
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Validate
+        run: |
+          set -euo pipefail
+          [ -f .terraform.lock.hcl ] || { echo "::error::.terraform.lock.hcl is missing. Run terraform init and commit it."; exit 1; }
+          terraform fmt -check -recursive || { echo "::error::run terraform fmt -recursive"; exit 1; }
+          terraform init -backend=false -input=false -lockfile=readonly
+          terraform validate -no-color
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: tf-plan-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ inputs.working_directory }}-${{ matrix.env.name }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(inputs.environments) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    env:
+      ENV_NAME: ${{ matrix.env.name }}
+      VAR_FILE: ${{ matrix.env.var_file }}
+      BACKEND_CONFIG: ${{ matrix.env.backend_config }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.env.plan_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Init
+        run: |
+          set -euo pipefail
+          args=()
+          [ -z "$BACKEND_CONFIG" ] || args+=("-backend-config=$BACKEND_CONFIG")
+          terraform init -input=false -lockfile=readonly "${args[@]}"
+
+      - name: Plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          WORKDIR: ${{ inputs.working_directory }}
+        run: |
+          set -uo pipefail
+          args=()
+          [ -z "$VAR_FILE" ] || args+=("-var-file=$VAR_FILE")
+          terraform plan -input=false -lock=false -no-color -detailed-exitcode "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/plan.txt"
+          code=${PIPESTATUS[0]}
+          case $code in
+            0) status="No changes" ;;
+            2) status="Changes" ;;
+            *) status="Failed" ;;
+          esac
+
+          # GitHub rejects comments over 65536 characters; bytes never undercount them.
+          marker="<!-- terraform-plan $WORKDIR $ENV_NAME -->"
+          size=$(wc -c < "$RUNNER_TEMP/plan.txt")
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "$marker"
+            echo "### Terraform plan \`$ENV_NAME\` ($WORKDIR): $status"
+            grep -E '^(Plan:|No changes\.)' "$RUNNER_TEMP/plan.txt" | tail -n 1 || true
+            echo
+            echo '```text'
+            head -c 60000 "$RUNNER_TEMP/plan.txt"
+            echo
+            echo '```'
+            [ "$size" -le 60000 ] || echo "Truncated at 60000 of $size bytes. The full plan is in the job log."
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+          id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            | jq -rs --arg m "$marker" 'add | map(select(.user.login == "github-actions[bot]" and (.body | startswith($m)))) | .[0].id // empty') \
+            || { echo "::error::could not list PR comments"; exit 1; }
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$body" >/dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F "body=@$body" >/dev/null
+          fi || { echo "::error::could not post the plan comment"; exit 1; }
+
+          [ "$status" != Failed ] || exit 1
+
+  apply:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        env: ${{ fromJSON(inputs.environments) }}
+    concurrency:
+      group: terraform-apply-${{ github.repository }}-${{ matrix.env.name }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    env:
+      VAR_FILE: ${{ matrix.env.var_file }}
+      BACKEND_CONFIG: ${{ matrix.env.backend_config }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.env.apply_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Init
+        run: |
+          set -euo pipefail
+          args=()
+          [ -z "$BACKEND_CONFIG" ] || args+=("-backend-config=$BACKEND_CONFIG")
+          terraform init -input=false -lockfile=readonly "${args[@]}"
+
+      - name: Apply
+        run: |
+          set -euo pipefail
+          args=()
+          [ -z "$VAR_FILE" ] || args+=("-var-file=$VAR_FILE")
+          terraform plan -input=false -no-color -out=tfplan "${args[@]}"
+          terraform apply -input=false -no-color tfplan
