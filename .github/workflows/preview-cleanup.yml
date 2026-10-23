@@ -1,0 +1,91 @@
+name: preview-cleanup
+
+# A preview is torn down when its ticket's last PR closes, but only if that close event reaches
+# preview-ticket. Anything it misses (skipped runs, --np retitles, Railway's own PR environments)
+# lingers and holds build slots, so sweep nightly with the same rules.
+
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run: { type: boolean, default: true, description: 'List what would be torn down, delete nothing' }
+
+permissions:
+  contents: read
+  id-token: write   # preview-lambdas.sh down, via bluejay-preview-ci
+
+env:
+  ORG: bluejay-ai-dev
+  PROJECT: 7047af18-477f-42e0-a905-f2e8f7ccac0f
+  BASE_ENV: preview-base
+  BASE_ENV_ID: 0a1b75a1-8402-418a-8192-00fe1613ec14
+  PREVIEW_DB_REF: kegttrzkpbpjzrrfxmpj
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
+          aws-region: us-west-1
+
+      - name: Tear down previews nothing wants
+        env:
+          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
+          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          # empty on the nightly schedule, which deletes for real
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -uo pipefail
+          [ -n "$GH_TOKEN" ] && [ -n "$RAILWAY_API_TOKEN" ] || { echo "::error::PREVIEW_GH_TOKEN and RAILWAY_TOKEN are required"; exit 1; }
+          npm i -g @railway/cli >/dev/null 2>&1
+          # same link-file trick as preview-ticket.yml: a team token cannot `railway link`
+          mkdir -p ~/.railway
+          jq -n --arg d "$PWD" --arg p "$PROJECT" --arg e "$BASE_ENV_ID" --arg n "$BASE_ENV" \
+            '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:$e,environmentName:$n,service:null}},
+              user:{id:"",token:null,accessToken:null,refreshToken:null,tokenExpiresAt:0}}' > ~/.railway/config.json
+          mgmt=$(railway variables -s frontend -e "$BASE_ENV" --json | jq -r '.SUPABASE_MANAGEMENT_API_TOKEN // empty')
+          echo "::add-mask::$mgmt"
+
+          for env_name in $(railway environment list --json | jq -r '.environments[].name'); do
+            if [[ "$env_name" =~ ^preview-([a-z]+-[0-9]+)$ ]]; then
+              ticket=$(tr '[:lower:]' '[:upper:]' <<<"${BASH_REMATCH[1]}")
+              # same rule as preview-ticket.yml: an open, non --np PR to main keeps it
+              # search allows 30 calls a minute, and a failed lookup must keep the env, never delete it
+              sleep 3
+              prs=$(gh search prs --owner "$ORG" --state open "$ticket in:title" --limit 50 \
+                      --json repository,number,title -q '.[] | [.repository.name, (.number|tostring), .title] | @tsv') \
+                || { echo "::warning::could not look up $ticket, keeping $env_name"; continue; }
+              keep=0
+              while IFS=$'\t' read -r repo n title; do
+                [ -n "${n:-}" ] || continue
+                grep -qiE "(^|[^A-Za-z0-9])$ticket([^0-9]|\$)" <<<"$title" || continue
+                v=$(gh pr view "$n" -R "$ORG/$repo" --json baseRefName,headRefName,title \
+                      -q 'if .baseRefName=="main" and ((.headRefName+.title)|contains("--np")|not) then 1 else 0 end') || v=1
+                [ "$v" = 1 ] && { keep=1; break; }
+              done <<<"$prs"
+              [ "$keep" = 1 ] && { echo "keep $env_name"; continue; }
+            elif [[ "$env_name" =~ ^([A-Za-z0-9._-]+)-pr-([0-9]+)$ ]]; then
+              # Railway's own per-PR environments: gone once their PR is
+              st=$(gh pr view "${BASH_REMATCH[2]}" -R "$ORG/${BASH_REMATCH[1]}" --json state -q .state 2>/dev/null) || st=""
+              case "$st" in CLOSED|MERGED) ;; *) echo "keep $env_name (${st:-unknown})"; continue ;; esac
+            else
+              continue   # preview-base, production, anything not ours
+            fi
+
+            if [ "$DRY_RUN" = true ]; then echo "would tear down $env_name"; continue; fi
+            railway environment delete "$env_name" --yes >/dev/null 2>&1 \
+              && echo "deleted $env_name" || echo "::warning::could not delete $env_name"
+            [[ "$env_name" == preview-* ]] || continue   # Railway's PR environments have no db branch or lambdas
+            id=$(curl -fsS --max-time 30 -H "Authorization: Bearer $mgmt" \
+                   "https://api.supabase.com/v1/projects/$PREVIEW_DB_REF/branches/$env_name" 2>/dev/null | jq -r '.id // empty')
+            [ -z "$id" ] || { curl -fsS -X DELETE --max-time 30 -H "Authorization: Bearer $mgmt" \
+                   "https://api.supabase.com/v1/branches/$id" >/dev/null && echo "deleted db branch $env_name"; } \
+              || echo "::warning::could not delete db branch $env_name"
+            bin/preview-lambdas.sh down "$env_name" || echo "::warning::could not remove $env_name's lambdas"
+          done
