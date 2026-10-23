@@ -22,6 +22,7 @@ manifest and nothing external in the merge path.
 | `enqueue.yml` | manual | merges a whole ticket in order, or nothing |
 | `hotfix.yml` | manual | one PR straight to main, for incidents, still needs green checks |
 | `deploy-dev.yml` | `workflow_call` | force-pushes a branch onto the caller's `dev`, so `dev` has that branch's exact history and the dev deploys run |
+| `terraform.yml` | `workflow_call` | fmt and validate, a plan comment per environment on PRs, apply in order on `main` |
 
 ## Scripts
 
