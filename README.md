@@ -149,7 +149,7 @@ Click on the **Actions** tab in your GitHub repository to view the simulation ru
 
 ## Terraform
 
-`.github/workflows/terraform.yml` gives every repo with an `infra/terraform` root the same checks. On every event it runs `terraform fmt -check`, `init -backend=false` and `validate`, and fails when `.terraform.lock.hcl` is missing. On a pull request it plans each environment and keeps one comment per environment on the PR, updated in place. On a push to `main` or a manual run on `main` it applies each environment in the listed order, one at a time.
+`.github/workflows/terraform.yml` gives every repo with an `infra/terraform` root the same checks. On every event it runs `terraform fmt -check`, `init -backend=false` and `validate`, and fails when `.terraform.lock.hcl` is missing. On a pull request from a branch of the same repo it plans each environment and keeps one comment per environment on the PR, updated in place. On a push to `main` or a manual run on `main` it applies each environment in the listed order, one at a time.
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
@@ -184,4 +184,4 @@ jobs:
           "apply_role_arn": "arn:aws:iam::123456789012:role/example-apply"}]
 ```
 
-The plan role is read-only and must trust the `repo:<owner>/<repo>:pull_request` OIDC subject. The apply role must trust only `repo:<owner>/<repo>:ref:refs/heads/main`. The lock file must hold checksums for `linux_amd64`, so run `terraform providers lock -platform=linux_amd64 -platform=darwin_arm64` if `init` rejects it.
+The `paths` filters must match `working_directory`, or changes to the root will not trigger a run. The plan role is read-only and must trust the `repo:<owner>/<repo>:pull_request` OIDC subject. The apply role must trust only `repo:<owner>/<repo>:ref:refs/heads/main`. The lock file must hold checksums for `linux_amd64`, so run `terraform providers lock -platform=linux_amd64 -platform=darwin_arm64` if `init` rejects it.
