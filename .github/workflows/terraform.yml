@@ -1,0 +1,237 @@
+name: terraform
+
+# fmt and validate on every event, a plan per environment on PRs, apply on main.
+# The plan role is read-only and trusts the pull_request OIDC subject. The apply role
+# trusts only refs/heads/main. An empty plan_role_arn or apply_role_arn skips AWS credentials.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory: { required: false, type: string, default: infra/terraform }
+      terraform_version: { required: false, type: string, default: 1.11.4 }
+      aws_region: { required: false, type: string, default: us-west-1 }
+      environments: { required: true, type: string }
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Validate
+        run: |
+          set -uo pipefail
+          fail() { echo "::error::$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [ -f .terraform.lock.hcl ] || fail ".terraform.lock.hcl is missing. Run terraform init and commit it."
+          terraform fmt -check -recursive || fail "Run terraform fmt -recursive."
+          terraform init -backend=false -input=false -lockfile=readonly || fail "terraform init failed, see the job log."
+          terraform validate -no-color || fail "terraform validate failed, see the job log."
+
+  plan:
+    # Fork PRs get no OIDC token and a read-only GITHUB_TOKEN, so they only validate.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: tf-plan-${{ github.repository }}-${{ github.event.pull_request.number }}-${{ inputs.working_directory }}-${{ matrix.env.name }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(inputs.environments) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    env:
+      ENV_NAME: ${{ matrix.env.name }}
+      VAR_FILE: ${{ matrix.env.var_file }}
+      BACKEND_CONFIG: ${{ matrix.env.backend_config }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      # The Plan step reports a failure here in the PR comment, so the comment never goes stale.
+      - id: aws
+        if: matrix.env.plan_role_arn != ''
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ matrix.env.plan_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Plan
+        env:
+          AWS_OUTCOME: ${{ steps.aws.outcome }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WORKDIR: ${{ inputs.working_directory }}
+        run: |
+          set +e -uo pipefail
+          out="$RUNNER_TEMP/plan.txt"
+          : > "$out"
+          code=1
+          reason=""
+          init_args=()
+          [ -z "$BACKEND_CONFIG" ] || init_args+=("-backend-config=$BACKEND_CONFIG")
+          plan_args=()
+          [ -z "$VAR_FILE" ] || plan_args+=("-var-file=$VAR_FILE")
+
+          if [ "$AWS_OUTCOME" = failure ]; then
+            reason="Could not assume the plan role."
+          elif [ -n "$VAR_FILE" ] && [ ! -f "$VAR_FILE" ]; then
+            reason="Var file $VAR_FILE is missing."
+          elif [ -n "$BACKEND_CONFIG" ] && [ ! -f "$BACKEND_CONFIG" ]; then
+            reason="Backend config $BACKEND_CONFIG is missing."
+          elif ! terraform init -input=false -lockfile=readonly "${init_args[@]}" > "$out" 2>&1; then
+            cat "$out"
+            reason="terraform init failed."
+          else
+            # The plan role cannot write the .tflock object, hence -lock=false. Exit 2 means changes.
+            terraform plan -input=false -lock=false -no-color -detailed-exitcode "${plan_args[@]}" 2>&1 | tee "$out"
+            code=${PIPESTATUS[0]}
+            [ "$code" = 0 ] || [ "$code" = 2 ] || reason="terraform plan failed."
+          fi
+          case $code in
+            0) status="No changes" ;;
+            2) status="Changes" ;;
+            *) status="Failed" ;;
+          esac
+
+          # GitHub rejects comments over 65536 characters; bytes never undercount them.
+          # A failure keeps the end of the log, where terraform prints the error.
+          marker="<!-- terraform-plan $WORKDIR $ENV_NAME -->"
+          size=$(wc -c < "$out")
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "$marker"
+            echo "### Terraform plan \`$ENV_NAME\` ($WORKDIR) at ${HEAD_SHA:0:7}: $status"
+            [ -z "$reason" ] || echo "$reason"
+            grep -E '^(Plan:|No changes\.)' "$out" | tail -n 1
+            if [ "$size" -gt 0 ]; then
+              echo
+              echo '```text'
+              if [ "$status" = Failed ]; then tail -c 60000 "$out"; else head -c 60000 "$out"; fi
+              echo
+              echo '```'
+              [ "$size" -le 60000 ] || echo "Truncated at 60000 of $size bytes. The full log is in the job log."
+            fi
+          } > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+          id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            | jq -rs --arg m "$marker" 'add | map(select(.user.login == "github-actions[bot]" and (.body | startswith($m)))) | .[0].id // empty') \
+            || { echo "::error::could not list PR comments"; exit 1; }
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F "body=@$body" >/dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F "body=@$body" >/dev/null
+          fi || { echo "::error::could not post the plan comment"; exit 1; }
+
+          [ -z "$reason" ] || { echo "::error::$ENV_NAME: $reason"; exit 1; }
+
+  apply:
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: terraform-apply-${{ github.repository }}-${{ inputs.working_directory }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      # main's head, so a delayed or re-run job never applies an older commit over a newer one.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      # One job loops the environments because matrix jobs have no guaranteed run order.
+      # configure-aws-credentials cannot run per iteration, so each role is assumed here.
+      - name: Apply
+        env:
+          ENVIRONMENTS: ${{ inputs.environments }}
+          AWS_REGION: ${{ inputs.aws_region }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          get() { jq -r --argjson i "$i" --arg k "$1" '.[$i][$k] // ""' <<<"$ENVIRONMENTS"; }
+          jq -e 'type == "array"' <<<"$ENVIRONMENTS" >/dev/null || fail "environments is not a JSON array."
+          n=$(jq length <<<"$ENVIRONMENTS")
+          sha=$(git rev-parse --short HEAD)
+          for ((i = 0; i < n; i++)); do
+            name=$(get name)
+            role=$(get apply_role_arn)
+            var_file=$(get var_file)
+            backend=$(get backend_config)
+            echo "::group::apply $name"
+            [ -z "$var_file" ] || [ -f "$var_file" ] || fail "$name: var file $var_file is missing."
+            [ -z "$backend" ] || [ -f "$backend" ] || fail "$name: backend config $backend is missing."
+
+            unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            if [ -n "$role" ]; then
+              token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+                "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -er .value) \
+                || fail "$name: could not get a GitHub OIDC token."
+              echo "::add-mask::$token"
+              creds=$(aws sts assume-role-with-web-identity --role-arn "$role" \
+                --role-session-name "GitHubActions-$GITHUB_RUN_ID" --web-identity-token "$token" \
+                --query Credentials --output json) || fail "$name: could not assume $role."
+              AWS_ACCESS_KEY_ID=$(jq -r .AccessKeyId <<<"$creds")
+              AWS_SECRET_ACCESS_KEY=$(jq -r .SecretAccessKey <<<"$creds")
+              AWS_SESSION_TOKEN=$(jq -r .SessionToken <<<"$creds")
+              echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+              echo "::add-mask::$AWS_SESSION_TOKEN"
+              export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            fi
+
+            args=()
+            [ -z "$backend" ] || args+=("-backend-config=$backend")
+            terraform init -input=false -lockfile=readonly -reconfigure "${args[@]}" || fail "$name: terraform init failed."
+            args=()
+            [ -z "$var_file" ] || args+=("-var-file=$var_file")
+            terraform plan -input=false -no-color -out=tfplan "${args[@]}" || fail "$name: terraform plan failed."
+            terraform apply -input=false -no-color tfplan || fail "$name: terraform apply failed."
+            echo "$name: applied $sha" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+          done

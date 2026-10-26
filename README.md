@@ -146,3 +146,50 @@ Click on the **Actions** tab in your GitHub repository to view the simulation ru
 | `final-status` | Final simulation status: `completed`, `failed`, `cancelled`, etc. |
 | `score` | Overall numeric score from the simulation. |
 | `report-url` | Link to the Bluejay simulation report (if available). |
+
+## Terraform
+
+`.github/workflows/terraform.yml` gives every repo with an `infra/terraform` root the same checks. On every event it runs `terraform fmt -check`, `init -backend=false` and `validate`, and fails when `.terraform.lock.hcl` is missing. On a pull request from a branch of the same repo it plans each environment and keeps one comment per environment on the PR, updated in place. On a push to `main` or a manual run on `main` it applies the head of `main` to each environment in the listed order and stops at the first failure. A repo with several roots calls it once per root.
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `environments` | Yes | — | JSON array, in apply order, of `{name, var_file, backend_config, plan_role_arn, apply_role_arn}`. Any of the last four may be `""`; an empty role ARN skips AWS credentials. |
+| `working_directory` | No | `infra/terraform` | The Terraform root. |
+| `terraform_version` | No | `1.11.4` | Pinned Terraform version. |
+| `aws_region` | No | `us-west-1` | Region for the AWS credentials. |
+
+```yaml
+name: terraform
+
+on:
+  pull_request:
+    paths: [infra/terraform/**, .github/workflows/terraform.yml]
+  push:
+    branches: [main]
+    paths: [infra/terraform/**, .github/workflows/terraform.yml]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  terraform:
+    uses: bluejay-ai-dev/bluejay-github-actions/.github/workflows/terraform.yml@main
+    with:
+      environments: >-
+        [{"name": "dev", "var_file": "dev.tfvars", "backend_config": "backend-dev.hcl",
+          "plan_role_arn": "arn:aws:iam::123456789012:role/example-plan",
+          "apply_role_arn": "arn:aws:iam::123456789012:role/example-apply"}]
+```
+
+Before a repo adopts it:
+
+1. Commit `.terraform.lock.hcl` with `linux_amd64` hashes: `terraform providers lock -platform=linux_amd64 -platform=darwin_arm64`.
+2. Make the plan role read-only, trusting only `repo:<owner>/<repo>:pull_request`. PR code runs with it, and it cannot take the state lock, so plans run with `-lock=false`.
+3. Make the apply role trust only `repo:<owner>/<repo>:ref:refs/heads/main`, and keep it from editing the CI roles themselves.
+4. Match the `paths` filters to `working_directory`, or changes to the root will not trigger a run.
+5. Run the first apply locally, since it creates the roles CI assumes.
+
+`tests/terraform` and `terraform-selftest.yml` exercise this workflow on every PR that changes it.
