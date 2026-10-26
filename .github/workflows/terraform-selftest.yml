@@ -1,0 +1,124 @@
+name: terraform-selftest
+
+# Runs terraform.yml against tests/terraform: local state, no AWS. The failure and apply paths
+# run the Plan and Apply step scripts directly, because a failing reusable call cannot be allowed.
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/terraform.yml
+      - .github/workflows/terraform-selftest.yml
+      - tests/terraform/**
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  terraform:
+    uses: ./.github/workflows/terraform.yml
+    with:
+      working_directory: tests/terraform
+      environments: >-
+        [{"name": "selftest", "var_file": "selftest.tfvars", "backend_config": "backend-a.hcl",
+          "plan_role_arn": "", "apply_role_arn": ""}]
+
+  check-comment:
+    needs: terraform
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: One fresh sticky comment, plan line first
+        run: |
+          set -euo pipefail
+          c=$(gh api --paginate "repos/$REPO/issues/$PR/comments" | jq -s --arg m '<!-- terraform-plan tests/terraform selftest -->' \
+            'add | map(select(.user.login == "github-actions[bot]" and (.body | startswith($m))))')
+          [ "$(jq length <<<"$c")" = 1 ] || { echo "::error::want exactly one selftest comment"; exit 1; }
+          jq -r '.[0].body' <<<"$c" > body.md
+          sed -n 2p body.md | grep -qF "at ${HEAD_SHA:0:7}: Changes" || { echo "::error::comment is stale or not Changes"; exit 1; }
+          sed -n 3p body.md | grep -q '^Plan: 1 to add' || { echo "::error::Plan line is not first"; exit 1; }
+          jq -r '.[0] | "comment \(.id) created \(.created_at) updated \(.updated_at)"' <<<"$c" >> "$GITHUB_STEP_SUMMARY"
+
+  plan-failure:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: tests/terraform
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      WORKDIR: tests/terraform
+      ENV_NAME: selftest-broken
+      VAR_FILE: broken.tfvars
+      BACKEND_CONFIG: backend-a.hcl
+      AWS_OUTCOME: skipped
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+      - name: A failing plan fails and posts the error
+        run: |
+          set -uo pipefail
+          yq '.jobs.plan.steps[] | select(.name == "Plan") | .run' ../../.github/workflows/terraform.yml > "$RUNNER_TEMP/plan.sh"
+          GITHUB_STEP_SUMMARY="$RUNNER_TEMP/inner.md" bash -e "$RUNNER_TEMP/plan.sh" 2>&1 | sed 's/^::error::/expected: /'
+          [ "${PIPESTATUS[0]}" = 1 ] || { echo "::error::plan step should exit 1"; exit 1; }
+          gh api --paginate "repos/$REPO/issues/$PR/comments" | jq -rs --arg m "<!-- terraform-plan $WORKDIR $ENV_NAME -->" \
+            'add | map(select(.user.login == "github-actions[bot]" and (.body | startswith($m)))) | .[0].body // ""' > body.md
+          grep -qF "at ${HEAD_SHA:0:7}: Failed" body.md || { echo "::error::no fresh Failed comment"; exit 1; }
+          grep -q '^terraform plan failed\.$' body.md || { echo "::error::comment has no reason"; exit 1; }
+          grep -q 'value is broken' body.md || { echo "::error::comment has no terraform error"; exit 1; }
+
+  apply-order:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/terraform
+    env:
+      AWS_REGION: us-west-1
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.11.4
+          terraform_wrapper: false
+      - name: Applies in order and stops at the first failure
+        run: |
+          set -uo pipefail
+          yq '.jobs.apply.steps[] | select(.name == "Apply") | .run' ../../.github/workflows/terraform.yml > "$RUNNER_TEMP/apply.sh"
+          e() { jq -cn --arg n "$1" --arg v "$2" --arg b "$3" '{name: $n, var_file: $v, backend_config: $b, plan_role_arn: "", apply_role_arn: ""}'; }
+          a=$(e a selftest.tfvars backend-a.hcl)
+          b=$(e b missing.tfvars backend-a.hcl)
+          c=$(e c selftest.tfvars backend-c.hcl)
+
+          ENVIRONMENTS="[$a,$c]" GITHUB_STEP_SUMMARY="$RUNNER_TEMP/ok.md" bash -e "$RUNNER_TEMP/apply.sh" \
+            || { echo "::error::apply of a, c should pass"; exit 1; }
+          [ "$(cut -d: -f1 "$RUNNER_TEMP/ok.md" | paste -sd,)" = a,c ] || { echo "::error::a and c did not apply in order"; exit 1; }
+
+          rm -f ./*.tfstate
+          ENVIRONMENTS="[$a,$b,$c]" GITHUB_STEP_SUMMARY="$RUNNER_TEMP/fail.md" bash -e "$RUNNER_TEMP/apply.sh" 2>&1 \
+            | sed 's/^::error::/expected: /'
+          [ "${PIPESTATUS[0]}" = 1 ] || { echo "::error::apply with b should exit 1"; exit 1; }
+          [ -f a.tfstate ] && [ ! -f c.tfstate ] || { echo "::error::c applied after b failed"; exit 1; }
+          grep -qF "b: var file missing.tfvars is missing." "$RUNNER_TEMP/fail.md" || { echo "::error::no reason in summary"; exit 1; }

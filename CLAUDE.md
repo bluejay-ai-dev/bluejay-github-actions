@@ -1,6 +1,6 @@
 # bluejay-github-actions
 
-Shared CI for the org. Nothing here runs on its own: the workflows are `workflow_call`,
+Shared CI for the org. Apart from `terraform-selftest`, nothing here runs on its own: the workflows are `workflow_call`,
 `workflow_dispatch` or `schedule`, and app repos hold a thin caller that is dormant behind
 a `gating-trial` label.
 
@@ -23,6 +23,7 @@ manifest and nothing external in the merge path.
 | `hotfix.yml` | manual | one PR straight to main, for incidents, still needs green checks |
 | `deploy-dev.yml` | `workflow_call` | force-pushes a branch onto the caller's `dev`, so `dev` has that branch's exact history and the dev deploys run |
 | `terraform.yml` | `workflow_call` | fmt and validate, a plan comment per environment on PRs, apply in order on `main` |
+| `terraform-selftest.yml` | PRs here touching it | runs `terraform.yml` against `tests/terraform` with local state |
 
 ## Scripts
 
