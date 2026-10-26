@@ -196,7 +196,7 @@ Before a repo adopts it:
 
 ## Infisical env
 
-`infisical-env/action.yml` loads named secrets from an Infisical project into the rest of the job's environment. It logs in with the job's GitHub OIDC token, so the job needs `permissions: id-token: write` and an Infisical machine identity with OIDC auth that trusts the calling repo. Only the listed keys are loaded, and a listed key missing from Infisical fails the step. Every line of every value is masked.
+`infisical-env/action.yml` loads named secrets from an Infisical project into the rest of the job's environment. It logs in with the job's GitHub OIDC token, so the job needs `permissions: id-token: write` and an Infisical machine identity with OIDC auth that trusts the calling repo. Only the listed keys are loaded, and a listed key missing from Infisical fails the step. Every line of every value is masked. It runs on Linux runners, x86_64 or arm64, and needs no sudo.
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
