@@ -13,7 +13,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # preview-lambdas.sh down, via bluejay-preview-ci
+  id-token: write   # AWS for preview-lambdas.sh down, Infisical OIDC for preview folders
 
 env:
   ORG: bluejay-ai-dev
@@ -21,6 +21,7 @@ env:
   BASE_ENV: preview-base
   BASE_ENV_ID: 0a1b75a1-8402-418a-8192-00fe1613ec14
   PREVIEW_DB_REF: kegttrzkpbpjzrrfxmpj
+  LK_INFISICAL_PROJECT: f3c164be-b60e-4346-9867-4e394ffbf445
 
 jobs:
   sweep:
@@ -40,6 +41,7 @@ jobs:
           RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           # empty on the nightly schedule, which deletes for real
           DRY_RUN: ${{ inputs.dry_run }}
+          INFISICAL_CI_IDENTITY_ID: ${{ vars.INFISICAL_CI_IDENTITY_ID }}
         run: |
           set -uo pipefail
           [ -n "$GH_TOKEN" ] && [ -n "$RAILWAY_API_TOKEN" ] || { echo "::error::PREVIEW_GH_TOKEN and RAILWAY_TOKEN are required"; exit 1; }
@@ -49,7 +51,17 @@ jobs:
           jq -n --arg d "$PWD" --arg p "$PROJECT" --arg e "$BASE_ENV_ID" --arg n "$BASE_ENV" \
             '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:$e,environmentName:$n,service:null}},
               user:{id:"",token:null,accessToken:null,refreshToken:null,tokenExpiresAt:0}}' > ~/.railway/config.json
-          mgmt=$(railway variables -s frontend -e "$BASE_ENV" --json | jq -r '.SUPABASE_MANAGEMENT_API_TOKEN // empty')
+          INFISICAL_TOKEN=$(bin/preview-secrets.sh login) || INFISICAL_TOKEN=""
+          [ -n "$INFISICAL_TOKEN" ] && [ "$INFISICAL_TOKEN" != null ] || { echo "::error::Infisical OIDC login failed"; exit 1; }
+          echo "::add-mask::$INFISICAL_TOKEN"; export INFISICAL_TOKEN
+          # every Infisical project a preview service reads, for its /previews folder
+          projects=$LK_INFISICAL_PROJECT
+          for svc in $(railway status --json | jq -r --arg e "$BASE_ENV" '.environments.edges[].node | select(.name==$e) | .serviceInstances.edges[].node.serviceName'); do
+            projects="$projects $(railway variables -s "$svc" -e "$BASE_ENV" --json 2>/dev/null | jq -r '.INFISICAL_PROJECT_ID // empty')"
+          done
+          projects=$(tr ' ' '\n' <<<"$projects" | sort -u | tr '\n' ' ')
+          fe=$(railway variables -s frontend -e "$BASE_ENV" --json | jq -r '.INFISICAL_PROJECT_ID // empty')
+          mgmt=$(bin/preview-secrets.sh dump "$fe" | jq -r '.SUPABASE_MANAGEMENT_API_TOKEN // empty')
           echo "::add-mask::$mgmt"
 
           for env_name in $(railway environment list --json | jq -r '.environments[].name'); do
@@ -88,4 +100,5 @@ jobs:
                    "https://api.supabase.com/v1/branches/$id" >/dev/null && echo "deleted db branch $env_name"; } \
               || echo "::warning::could not delete db branch $env_name"
             bin/preview-lambdas.sh down "$env_name" || echo "::warning::could not remove $env_name's lambdas"
+            for p in $projects; do bin/preview-secrets.sh rm "$p" "${env_name#preview-}"; done
           done

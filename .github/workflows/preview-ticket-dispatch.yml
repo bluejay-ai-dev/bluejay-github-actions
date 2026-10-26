@@ -1,0 +1,21 @@
+name: preview-ticket-dispatch
+
+# Service repositories dispatch here so preview setup runs under one repository-level
+# concurrency queue per ticket, even when several sibling PRs are pushed together.
+on:
+  repository_dispatch:
+    types: [preview-ticket]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run:
+    uses: ./.github/workflows/preview-ticket-run.yml
+    with:
+      repo: ${{ github.event.client_payload.repo }}
+      pr: ${{ github.event.client_payload.pr }}
+      action: ${{ github.event.client_payload.action }}
+      ticket: ${{ github.event.client_payload.ticket }}
+    secrets: inherit

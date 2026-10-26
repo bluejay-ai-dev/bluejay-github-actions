@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """End-to-end smoke check of one Railway preview environment. Reads the environment's own
-middleware variables (database, hash secret, AWS key, queues), mints an idempotent API key
+middleware config from Railway and its secrets from Infisical (database, hash secret, AWS key), mints an idempotent API key
 for its org, then drives a chat sim and a web voice sim through the public API and checks
 evals, uptime and notifications. Email sims are not covered: previews have no inbox yet.
 
   bin/preview-smoke [env]        env defaults to preview-base
 
-Needs the railway CLI logged in, psql and the aws CLI. Prints names and ids, never secrets.
+Needs the railway and infisical CLIs logged in, psql and the aws CLI. Prints names and ids, never secrets.
 Exit 1 when any check fails."""
 import hashlib, hmac, json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 
@@ -23,7 +23,16 @@ def rvars(svc):
     return json.loads(sh("railway", "variables", "-p", PROJECT, "-s", svc, "-e", ENV, "--json"))
 
 
+def infisical(project, path):
+    # the env's secrets live in Infisical (its /previews folder imports /), never on Railway
+    tok = sh("infisical", "user", "get", "token", "--plain").splitlines()[-1]
+    out = sh("infisical", "export", "--format=json", "--silent", f"--projectId={project}", "--env=preview",
+             f"--path={path}", f"--token={tok}")
+    return {x["key"]: x["value"] for x in json.loads(out)}
+
+
 mw_vars, fe_vars = rvars("middleware"), rvars("frontend")
+mw_vars = {**mw_vars, **infisical(mw_vars["INFISICAL_PROJECT_ID"], mw_vars.get("INFISICAL_SECRET_PATH", "/"))}
 MW = f"https://{mw_vars['RAILWAY_PUBLIC_DOMAIN']}"
 FE = f"https://{fe_vars['RAILWAY_PUBLIC_DOMAIN']}"
 # the session pooler on 5432 caps at 15 clients and the services hold them, so read through 6543
