@@ -76,7 +76,7 @@ jobs:
           terraform_wrapper: false
       - name: A failing plan fails and posts the error
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           yq '.jobs.plan.steps[] | select(.name == "Plan") | .run' ../../.github/workflows/terraform.yml > "$RUNNER_TEMP/plan.sh"
           GITHUB_STEP_SUMMARY="$RUNNER_TEMP/inner.md" bash -e "$RUNNER_TEMP/plan.sh" 2>&1 | sed 's/^::error::/expected: /'
           [ "${PIPESTATUS[0]}" = 1 ] || { echo "::error::plan step should exit 1"; exit 1; }
@@ -105,7 +105,7 @@ jobs:
           terraform_wrapper: false
       - name: Applies in order and stops at the first failure
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           yq '.jobs.apply.steps[] | select(.name == "Apply") | .run' ../../.github/workflows/terraform.yml > "$RUNNER_TEMP/apply.sh"
           e() { jq -cn --arg n "$1" --arg v "$2" --arg b "$3" '{name: $n, var_file: $v, backend_config: $b, plan_role_arn: "", apply_role_arn: ""}'; }
           a=$(e a selftest.tfvars backend-a.hcl)
