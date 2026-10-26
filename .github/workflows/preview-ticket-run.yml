@@ -166,10 +166,12 @@ jobs:
           for entry in $RAILWAY_REPOS; do
             svc=${entry##*:}
             vars=$(railway variables -s "$svc" -e "$BASE_ENV" --json)
-            leaks=$(jq -r --arg p "$sensitive" 'keys[]
-              | select(. != "INFISICAL_CLIENT_SECRET")
-              | select((startswith("NEXT_PUBLIC_") | not) and (. != "SUPABASE_ANON_KEY"))
-              | select(test($p; "i") or test("(^|_)KEY($|_)"; "i") or test("^(DATABASE|REDIS|MONGO|POSTGRES|MYSQL)_(URL|URI)$"; "i"))' <<<"$vars")
+            leaks=$(jq -r --arg p "$sensitive" 'to_entries[]
+              | select(.key != "INFISICAL_CLIENT_SECRET" and .key != "INFISICAL_SECRET_PATH")
+              | select(.key != "SUPABASE_ANON_KEY" and .key != "NEXT_PUBLIC_SUPABASE_ANON_KEY")
+              | select((.key | test($p; "i") or test("(^|_)KEY($|_)"; "i") or test("^(DATABASE|REDIS|MONGO|POSTGRES|MYSQL)_(URL|URI)$"; "i"))
+                  or (.value | tostring | test("^[a-z][a-z0-9+.-]*://[^/@]*:[^/@]+@"; "i")))
+              | .key' <<<"$vars")
             [ -z "$leaks" ] || { echo "::error::$svc still has secret-looking Railway variables ($(tr '\n' ' ' <<<"$leaks")); move them to Infisical before creating a preview"; exit 1; }
           done
 
