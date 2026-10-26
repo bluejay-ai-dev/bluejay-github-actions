@@ -193,3 +193,33 @@ Before a repo adopts it:
 5. Run the first apply locally, since it creates the roles CI assumes.
 
 `tests/terraform` and `terraform-selftest.yml` exercise this workflow on every PR that changes it.
+
+## Infisical env
+
+`infisical-env/action.yml` loads named secrets from an Infisical project into the rest of the job's environment. It logs in with the job's GitHub OIDC token, so the job needs `permissions: id-token: write` and an Infisical machine identity with OIDC auth that trusts the calling repo. Only the listed keys are loaded, and a listed key missing from Infisical fails the step. Every line of every value is masked.
+
+| Input | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `project_id` | Yes | — | Infisical project id, not the slug. |
+| `identity_id` | Yes | — | Infisical machine identity id. |
+| `environment` | No | `local` | Infisical environment slug. |
+| `keys` | Yes | — | Secret names, separated by spaces or newlines. |
+
+```yaml
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: bluejay-ai-dev/bluejay-github-actions/infisical-env@main
+        with:
+          project_id: 00000000-0000-0000-0000-000000000000
+          identity_id: 00000000-0000-0000-0000-000000000000
+          keys: |
+            OPENAI_API_KEY
+            RESEND_API_KEY
+```
+
+There is no option to load everything. Environments like `local` also hold AWS credentials, database URLs and `ENVIRONMENT`, which would override the job's own role and database.
