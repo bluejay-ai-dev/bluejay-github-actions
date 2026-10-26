@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Wire one preview-base service the way every preview service works: secrets in its Infisical
-project's `preview` env, readable only by the `preview` identity, and on Railway only what differs
-per preview (database, Supabase, sibling URLs). Prints names, never values.
+project's `preview` env, readable only by the `preview` identity, and on Railway nothing secret:
+the Infisical login and non-secret config like sibling URLs. preview-ticket puts each preview's
+own database and Supabase values in /previews/<ticket> in Infisical. Prints names, never values.
 
   bin/preview-add-service uptime sim-cron            known services, see SERVICES
   bin/preview-add-service my-svc --project <infisical id> --from <prod railway service> \
@@ -34,9 +35,6 @@ SERVICES = {
     "lk-outbound": ("f3c164be-b60e-4346-9867-4e394ffbf445", None, "dev", LK),
     "lk-inbound": ("f3c164be-b60e-4346-9867-4e394ffbf445", None, "dev", LK),
 }
-# differ per preview, so they live on Railway where preview-ticket swaps them
-PER_PREVIEW = {"SQS_NOTIFICATION_QUEUE_URL", "DATABASE_URL", "SUPABASE_URL", "SUPABASE_SERVICE_KEY",
-               "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_JWT_SECRET"}
 
 p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 p.add_argument("names", nargs="+", help="preview-base service names")
@@ -75,6 +73,9 @@ if not all((ident, cid, csec)):
     sys.exit("set PREVIEW_IDENTITY_ID, PREVIEW_IDENTITY_CLIENT_ID and PREVIEW_IDENTITY_CLIENT_SECRET")
 tok = sh("infisical", "user", "get", "token", "--plain").strip().splitlines()[-1]
 mw = rw("middleware", BASE)
+# middleware's secrets live in Infisical now, so that is where the base values come from
+mw.update({x["secretKey"]: x["secretValue"] for x in inf(
+    "GET", f"/v3/secrets/raw?workspaceId={mw['INFISICAL_PROJECT_ID']}&environment=preview&secretPath=/").get("secrets", [])})
 
 
 def db(orig):
@@ -112,9 +113,8 @@ for name in a.names:
         elif k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "REDIS_URL", "INTERNAL_API_TOKEN", "API_KEY_HASH_SECRET") and k in mw: s[k] = mw[k]
         elif k == "SQS_NOTIFICATION_QUEUE_URL": s[k] = mw["NOTIFICATION_SQS_QUEUE_URL"]
         elif "sqs." in v and "/Dev" in v: s[k] = v.replace("/Dev", "/Sandbox")
-    railway = {k: s.pop(k) for k in list(s) if k in PER_PREVIEW}
     for k in extra: s.pop(k, None)
-    railway.update(extra)
+    railway = dict(extra)
     railway.update({"INFISICAL_CLIENT_ID": cid, "INFISICAL_CLIENT_SECRET": csec, "INFISICAL_PROJECT_ID": proj,
                     "INFISICAL_ENVIRONMENT": "preview", "PREVIEW_IDLE": "0"})
 

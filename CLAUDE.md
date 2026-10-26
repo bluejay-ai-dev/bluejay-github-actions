@@ -84,6 +84,13 @@ exit 2 and no message, and killed `build` inside `npm ci`'s postinstall.
 
 `preview-cleanup.yml` sweeps nightly for previews whose ticket has no open PR to main.
 
+**No secrets on Railway.** A preview service carries only its Infisical login and non-secret
+config. Shared preview secrets sit in the root of its Infisical project's `preview` env; each
+preview's own values (db branch URL, Supabase keys) go in `/previews/<ticket>` there, which
+imports `/`, and the service reads it through `INFISICAL_SECRET_PATH`. `bin/preview-secrets.sh`
+writes and deletes those folders; the Action logs in to Infisical with GitHub OIDC as the
+identity in the org variable `INFISICAL_CI_IDENTITY_ID`, and fails if it finds a secret on Railway.
+
 ## Exit codes, shared by suite.sh and enqueue.sh
 
 `0` pass, `1` regression, `2` usage, `3` fixtures or prereqs missing, `4` provider config
