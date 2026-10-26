@@ -84,12 +84,21 @@ exit 2 and no message, and killed `build` inside `npm ci`'s postinstall.
 
 `preview-cleanup.yml` sweeps nightly for previews whose ticket has no open PR to main.
 
-**No secrets on Railway.** A preview service carries only its Infisical login and non-secret
-config. Shared preview secrets sit in the root of its Infisical project's `preview` env; each
-preview's own values (db branch URL, Supabase keys) go in `/previews/<ticket>` there, which
-imports `/`, and the service reads it through `INFISICAL_SECRET_PATH`. `bin/preview-secrets.sh`
-writes and deletes those folders; the Action logs in to Infisical with GitHub OIDC as the
-identity in the org variable `INFISICAL_CI_IDENTITY_ID`, and fails if it finds a secret on Railway.
+**Application and database secrets stay in Infisical.** Railway needs each service's
+`INFISICAL_CLIENT_SECRET` as a bootstrap credential so it can log in; the preview workflow
+allows that one Railway secret plus non-secret config. It checks `preview-base` variable names
+and stops if it finds secret-looking entries before duplicating the environment. Shared preview
+secrets sit in the root of each Infisical project's `preview` env; a ticket's database URL and
+Supabase keys go in `/previews/<ticket>`, which imports `/`. The service reads that folder
+through `INFISICAL_SECRET_PATH`. `bin/preview-secrets.sh` writes and deletes those folders, and
+GitHub OIDC gives the `preview-ci` identity a short-lived Infisical token through the org
+variable `INFISICAL_CI_IDENTITY_ID`.
+
+Service callers dispatch preview work back to this repository. That puts all runs for the
+same ticket in one GitHub Actions concurrency group, even when sibling PRs in different
+repositories update together. `preview-ticket-dispatch.yml` routes the event to
+`preview-ticket-run.yml`; keep this path central so those runs cannot race over one Railway
+environment or database branch.
 
 ## Exit codes, shared by suite.sh and enqueue.sh
 
@@ -121,8 +130,9 @@ which is `actions:write` on this repo only and cannot read anything else.
 
 - `LINEAR_API_KEY` and `SANDBOX_GH_TOKEN` are set on all eight app repos. Without them the
   gate fails closed and says which one is missing, rather than passing blind.
-- `INFISICAL_TOKEN` and `RAILWAY_TOKEN` are still unset. The build job skips the Infisical
-  step when absent, so this degrades rather than breaking.
+- `INFISICAL_TOKEN` and `RAILWAY_TOKEN` are still unset for the optional deterministic build
+  checks, so that step skips. Preview runs use the separate OIDC flow above and require
+  `INFISICAL_CI_IDENTITY_ID` plus project-level access for `preview-ci`.
 - `suite.sh preflight` is the manifest for the suite's own fixtures and cannot drift from
   the code. The daily's prod fixtures are listed in `bin/DAILY_FIXTURES.md` and are not
   set yet.

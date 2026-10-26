@@ -1,418 +1,45 @@
-name: preview-ticket
+name: request-preview-ticket
 
-# One preview per TICKET, not per PR.
-#
-# Railway's own PR Environments make one environment per pull request, so a ticket spanning
-# middleware and frontend gets two, each holding half the change, and two links. This makes
-# a single environment per ticket with every sibling PR's branch checked out, and repos the
-# ticket does not touch left on main. One link, the whole feature, prod-shaped.
-#
-# Gated on a label so it only runs for PRs that ask for it. Railway's automatic PR
-# Environments should be OFF, or you get both.
-
+# Called by each service repository. Resolve the PR's ticket, then hand the work to
+# bluejay-github-actions so sibling repositories share one concurrency queue per ticket.
 on:
   workflow_call:
     inputs:
-      repo:    { required: true, type: string }
-      pr:      { required: true, type: string }
-      action:  { required: true, type: string }
+      repo:   { required: true, type: string }
+      pr:     { required: true, type: string }
+      action: { required: true, type: string }
     secrets:
-      RAILWAY_TOKEN:   { required: true }
+      RAILWAY_TOKEN: { required: false }
       PREVIEW_GH_TOKEN: { required: true }
-      LINEAR_API_KEY:  { required: false }
+      LINEAR_API_KEY: { required: false }
 
 permissions:
   contents: read
-  id-token: write   # AWS (bluejay-preview-ci) for lambdas, and Infisical OIDC for secrets
-
-env:
-  ORG: bluejay-ai-dev
-  PROJECT: 7047af18-477f-42e0-a905-f2e8f7ccac0f
-  BASE_ENV: preview-base
-  BASE_ENV_ID: 0a1b75a1-8402-418a-8192-00fe1613ec14
-  # bluejay-previews: main's schema plus a slice of prod. Each ticket gets a branch of it
-  # with that data, so previews never share a database or its connection slots.
-  PREVIEW_DB_REF: kegttrzkpbpjzrrfxmpj
-  PREVIEW_PG_HOST: aws-1-ca-central-1.pooler.supabase.com
-  # not Railway services, but a PR in one still wants the ticket's preview and its link
-  LAMBDA_REPOS: evals:x text_agent:x emails-lambda:x livekit_dispatcher:x
-  # Secrets never go on Railway. Each service reads its Infisical project's `preview` env, and a
-  # preview's own values sit in /previews/<ticket> there, which imports /. Railway carries only
-  # INFISICAL_SECRET_PATH, plus each service's Infisical login like prod.
-  LK_INFISICAL_PROJECT: f3c164be-b60e-4346-9867-4e394ffbf445
-  # preview-base is the permanent environment: every registered service on main, always
-  # on. Its service list is the registry, read at run time, so adding a service there
-  # (plus the repo's preview.yml caller) is the whole setup. Lambdas are preview-lambda.yml.
 
 jobs:
-  ticket:
+  dispatch:
     runs-on: ubuntu-latest
-    # a fresh db branch alone can take 10 minutes to come up
-    timeout-minutes: 45
-    # pushes to one PR queue instead of racing on its ticket's db password and environment
-    concurrency:
-      group: preview-${{ inputs.repo }}-${{ inputs.pr }}
-      cancel-in-progress: false
     steps:
-      - name: Resolve the ticket and whether it wants a preview
-        id: t
+      - name: Dispatch one serialized preview run
         env:
           GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
-          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           REPO: ${{ inputs.repo }}
           PR: ${{ inputs.pr }}
+          ACTION: ${{ inputs.action }}
         run: |
           set -euo pipefail
-          title=$(gh pr view "$PR" -R "$ORG/$REPO" --json title -q .title)
+          [[ "$REPO" =~ ^[A-Za-z0-9._-]+$ && "$PR" =~ ^[0-9]+$ ]] || { echo "::error::invalid repository or PR in preview request"; exit 1; }
+          title=$(gh pr view "$PR" -R "bluejay-ai-dev/$REPO" --json title -q .title)
           ticket=$(grep -oiE '\b[A-Z]+-[0-9]+\b' <<<"$title" | head -1 | tr '[:lower:]' '[:upper:]' || true)
-          if [ -z "$ticket" ]; then
-            echo "no ticket id in the title, nothing to group"
-            echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          echo "ticket=$ticket" >> "$GITHUB_OUTPUT"
-          echo "env_name=preview-$(tr '[:upper:]' '[:lower:]' <<<"$ticket")" >> "$GITHUB_OUTPUT"
-          services=$(curl -fsS --max-time 20 https://backboard.railway.com/graphql/v2 \
-            -H "Authorization: Bearer $RAILWAY_API_TOKEN" -H 'content-type: application/json' \
-            -d "$(jq -nc --arg id "$BASE_ENV_ID" '{query:"query($id:String!){environment(id:$id){serviceInstances{edges{node{serviceName source{repo}}}}}}",variables:{id:$id}}')" \
-            | jq -c '[.data.environment.serviceInstances.edges[].node | select(.source.repo)]')
-          # fail closed: a skipped service would run its workers on main with no PREVIEW_IDLE
-          bad=$(jq -r '.[] | select([.serviceName, .source.repo] | all(test("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)?$")) | not) | .serviceName' <<<"$services")
-          [ -z "$bad" ] || { echo "::error::$BASE_ENV services with unsupported names or repos: $bad"; exit 1; }
-          RAILWAY_REPOS=$(jq -r 'map("\(.source.repo | split("/")[1]):\(.serviceName)") | join(" ")' <<<"$services")
-          [ -n "$RAILWAY_REPOS" ] || { echo "::error::could not read the services in $BASE_ENV"; exit 1; }
-          echo "services in $BASE_ENV: $RAILWAY_REPOS"
-          echo "RAILWAY_REPOS=$RAILWAY_REPOS" >> "$GITHUB_ENV"
+          [ -n "$ticket" ] || { echo "no ticket id in the PR title; skipping"; exit 0; }
 
-          # A ticket keeps its preview while ANY of its PRs still wants one. One PR closing
-          # must not pull the environment out from under the rest.
-          # Wanting one means targeting main. A preview mirrors prod, so it only makes
-          # sense for a PR that is actually headed there; dev PRs get nothing.
-          # --np opts a single PR out. It does not veto the ticket: a docs-only PR beside a
-          # real one should not cost the rest of the ticket its environment.
-          want=0
-          for entry in $RAILWAY_REPOS $LAMBDA_REPOS; do
-            r=${entry%%:*}
-            while IFS=$'\t' read -r n base head title; do
-              [ -n "${n:-}" ] || continue
-              case "$head$title" in *--np*) echo "$r#$n is --np, not counting it"; continue ;; esac
-              [ "$base" = main ] && want=1
-            done < <(gh pr list -R "$ORG/$r" --state open --search "$ticket in:title" --limit 10 \
-                     --json number,baseRefName,headRefName,title \
-                     -q '.[] | [(.number|tostring), .baseRefName, .headRefName, .title] | @tsv')
-          done
-          echo "want=$want" >> "$GITHUB_OUTPUT"
-
-      - name: Install the Railway CLI and link the project
-        if: steps.t.outputs.skip != '1'
-        env:
-          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: |
-          set -euo pipefail
-          npm i -g @railway/cli >/dev/null 2>&1
-          # `railway environment` takes no --project, it reads the linked one, and
-          # `railway link` needs a user the team token does not have. The link file is
-          # just ids, so write it.
-          mkdir -p ~/.railway
-          jq -n --arg d "$PWD" --arg p "$PROJECT" --arg e "$BASE_ENV_ID" --arg n "$BASE_ENV" \
-            '{projects:{($d):{projectPath:$d,name:"Bluejay",project:$p,environment:$e,environmentName:$n,service:null}},
-              user:{id:"",token:null,accessToken:null,refreshToken:null,tokenExpiresAt:0}}' \
-            > ~/.railway/config.json
-          railway environment list >/dev/null
-
-      # this repo, not the caller's: bin/preview-lambdas.sh lives here
-      - uses: actions/checkout@v4
-        if: steps.t.outputs.skip != '1'
-        with:
-          repository: bluejay-ai-dev/bluejay-github-actions
-          ref: ${{ github.job_workflow_sha }}
-          path: .gating
-          token: ${{ secrets.PREVIEW_GH_TOKEN }}
-
-      - uses: aws-actions/configure-aws-credentials@v4
-        if: steps.t.outputs.skip != '1'
-        with:
-          role-to-assume: arn:aws:iam::148660429236:role/bluejay-preview-ci
-          aws-region: us-west-1
-
-      - name: Log in to Infisical
-        if: steps.t.outputs.skip != '1'
-        env:
-          INFISICAL_CI_IDENTITY_ID: ${{ vars.INFISICAL_CI_IDENTITY_ID }}
-          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: |
-          set -euo pipefail
-          [ -n "$INFISICAL_CI_IDENTITY_ID" ] || { echo "::error::org variable INFISICAL_CI_IDENTITY_ID is not set"; exit 1; }
-          t=$(.gating/bin/preview-secrets.sh login) || t=""
-          [ -n "$t" ] && [ "$t" != null ] || { echo "::error::Infisical OIDC login failed"; exit 1; }
-          echo "::add-mask::$t"; echo "INFISICAL_TOKEN=$t" >> "$GITHUB_ENV"
-          # every service's Infisical project, read once: <service>:<project id>
-          sp=""
-          for entry in $RAILWAY_REPOS; do
-            svc=${entry##*:}
-            proj=$(railway variables -s "$svc" -e "$BASE_ENV" --json | jq -r '.INFISICAL_PROJECT_ID // empty')
-            case "$svc" in lk-*) proj=${proj:-$LK_INFISICAL_PROJECT} ;; esac
-            [ -z "$proj" ] || sp="$sp $svc:$proj"
-          done
-          echo "SERVICE_PROJECTS=$sp" >> "$GITHUB_ENV"
-          fe=$(tr ' ' '\n' <<<"$sp" | sed -n 's/^frontend://p')
-          mgmt=$(.gating/bin/preview-secrets.sh dump "$fe" | jq -r '.SUPABASE_MANAGEMENT_API_TOKEN // empty')
-          [ -n "$mgmt" ] || { echo "::error::no SUPABASE_MANAGEMENT_API_TOKEN in the frontend project's Infisical preview env"; exit 1; }
-          echo "::add-mask::$mgmt"; echo "SUPABASE_MGMT=$mgmt" >> "$GITHUB_ENV"
-
-      - name: Tear the ticket's preview down
-        if: steps.t.outputs.skip != '1' && steps.t.outputs.want == '0'
-        env:
-          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          ENV_NAME: ${{ steps.t.outputs.env_name }}
-        run: |
-          set -uo pipefail
-          if railway environment list 2>/dev/null | grep -q "$ENV_NAME"; then
-            railway environment delete "$ENV_NAME" --yes >/dev/null 2>&1 \
-              && echo "deleted $ENV_NAME" || echo "::warning::could not delete $ENV_NAME"
-          else
-            echo "$ENV_NAME does not exist, nothing to tear down"
-          fi
-          mgmt=$SUPABASE_MGMT
-          for sp in $SERVICE_PROJECTS; do .gating/bin/preview-secrets.sh rm "${sp##*:}" "${ENV_NAME#preview-}"; done
-          id=$(curl -fsS --max-time 30 -H "Authorization: Bearer $mgmt" \
-                 "https://api.supabase.com/v1/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" 2>/dev/null | jq -r '.id // empty')
-          [ -z "$id" ] || { curl -fsS -X DELETE --max-time 30 -H "Authorization: Bearer $mgmt" \
-                 "https://api.supabase.com/v1/branches/$id" >/dev/null && echo "deleted db branch $ENV_NAME"; } \
-            || echo "::warning::could not delete db branch $ENV_NAME"
-          .gating/bin/preview-lambdas.sh down "$ENV_NAME" || echo "::warning::could not remove $ENV_NAME's lambdas"
-
-      - name: Build or refresh the ticket's preview
-        id: up
-        if: steps.t.outputs.skip != '1' && steps.t.outputs.want == '1'
-        env:
-          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
-          RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          TICKET: ${{ steps.t.outputs.ticket }}
-          ENV_NAME: ${{ steps.t.outputs.env_name }}
-        run: |
-          set -uo pipefail
-          # Each Railway service points at its own repo's PR branch for this ticket, or stays
-          # on main when the ticket does not touch that repo. That is the shared baseline.
-          args=()
-          touched=""
-          for entry in $RAILWAY_REPOS; do
-            r=${entry%%:*}; svc=${entry##*:}
-            br=$(gh pr list -R "$ORG/$r" --state open --search "$TICKET in:title" --limit 10 \
-                 --json number,title,headRefName \
-                 -q "first(.[] | select((.title | test(\"(^|[^A-Za-z0-9])$TICKET([^0-9]|\$)\";\"i\")) and ((.headRefName + .title) | contains(\"--np\") | not)) | .headRefName) // \"\"")
-            # Every preview has its own database, so its workers run whether or not the ticket
-            # touched them. A lambda-only ticket touches none of these and still gets an environment.
-            # Untouched services build once at creation. A path no commit touches stops every
-            # merge to main from rebuilding them in every preview and starving prod of build slots.
-            [ -n "$br" ] || { echo "$r: main (untouched)"; args+=(--service-config "$svc" variables.PREVIEW_IDLE.value 0 --service-config "$svc" build.watchPatterns '["/.preview-never-rebuild"]'); continue; }
-            echo "$r: $br"
-            args+=(--service-config "$svc" source.branch "$br" --service-config "$svc" variables.PREVIEW_IDLE.value 0)
-            touched="$touched $r"
-          done
-
-          # The ticket's own database: a branch of bluejay-previews, reused across refreshes
-          # so its data survives a push. Its credentials go into the duplicate's variables
-          # below, in the same atomic create, so no service ever starts on the base data.
-          mgmt=$SUPABASE_MGMT
-          sb() { curl -fsS --max-time 60 -H "Authorization: Bearer $mgmt" -H 'content-type: application/json' "$@"; }
-          api=https://api.supabase.com/v1
-          bref=$(sb "$api/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" 2>/dev/null | jq -r '.project_ref // empty') || bref=""
-          if [ -z "$bref" ]; then
-            # a sibling repo's run may create it first, so read it back before giving up
-            bref=$(sb -X POST "$api/projects/$PREVIEW_DB_REF/branches" \
-                     -d "$(jq -nc --arg n "$ENV_NAME" '{branch_name:$n, with_data:true}')" | jq -r '.project_ref // empty') \
-              || bref=$(sb "$api/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" | jq -r '.project_ref // empty') || bref=""
-            [ -n "$bref" ] || { echo "::error::could not create db branch $ENV_NAME"; exit 1; }
-            echo "created db branch $ENV_NAME ($bref)"
-          fi
-          for _ in $(seq 1 60); do
-            st=$(sb "$api/projects/$PREVIEW_DB_REF/branches/$ENV_NAME" | jq -r .status) || st=""
-            case "$st" in ACTIVE_HEALTHY|FUNCTIONS_DEPLOYED) break ;; *FAILED*) echo "::error::db branch $st"; exit 1 ;; esac
-            sleep 10
-          done
-          case "$st" in ACTIVE_HEALTHY|FUNCTIONS_DEPLOYED) ;; *) echo "::error::db branch still $st after 10 minutes"; exit 1 ;; esac
-          pw=$(openssl rand -hex 24); echo "::add-mask::$pw"
-          sb -X PATCH "$api/projects/$bref/database/password" -d "$(jq -nc --arg p "$pw" '{password:$p}')" >/dev/null \
-            || { echo "::error::could not set the db branch password"; exit 1; }
-          # the pooler takes ~20s to accept a new password
-          up=0
-          for _ in $(seq 1 18); do
-            PGPASSWORD="$pw" psql "host=$PREVIEW_PG_HOST port=5432 user=postgres.$bref dbname=postgres sslmode=require connect_timeout=10" \
-              -X -A -t -c 'select 1' >/dev/null 2>&1 && { up=1; break; }
-            sleep 10
-          done
-          [ "$up" = 1 ] || { echo "::error::the pooler never accepted the db branch password"; exit 1; }
-          keys=$(sb "$api/projects/$bref/api-keys?reveal=true")
-          anon=$(jq -r '.[]|select(.name=="anon").api_key' <<<"$keys"); svckey=$(jq -r '.[]|select(.name=="service_role").api_key' <<<"$keys")
-          echo "::add-mask::$anon"; echo "::add-mask::$svckey"
-          # sign-in on the branch: the base project's auth settings, this preview's frontend as the site
-          sb "$api/projects/$PREVIEW_DB_REF/config/auth" \
-            | jq -c --arg site "https://frontend-$ENV_NAME.up.railway.app" \
-                'with_entries(select(.key|test("^(external_google_|external_email_enabled|mailer_|jwt_exp|uri_allow_list)"))
-                 | select(.value!=null)) + {site_url:$site}' \
-            | sb -X PATCH "$api/projects/$bref/config/auth" -d @- >/dev/null \
-            || echo "::warning::could not copy auth settings to the db branch"
-
-          # the ticket's own migrations, when it has a middleware PR
-          mwbr=$(gh pr list -R "$ORG/bluejay_middleware" --state open --search "$TICKET in:title" --limit 5 \
-                   --json headRefName,baseRefName,title \
-                   -q 'first(.[]|select(.baseRefName=="main" and ((.headRefName+.title)|contains("--np")|not)).headRefName) // ""') || mwbr=""
-          if [ -n "$mwbr" ]; then
-            git clone -q --depth 1 --branch "$mwbr" "https://x-access-token:$GH_TOKEN@github.com/$ORG/bluejay_middleware.git" /tmp/mw
-            curl -fsSL -o /tmp/dbmate https://github.com/amacneil/dbmate/releases/download/v2.33.0/dbmate-linux-amd64
-            echo "dfd4027141b6e4357158099bdfe6c02b286af70f8e49057937744cf80b38ea1c  /tmp/dbmate" | sha256sum -c - >/dev/null
-            chmod +x /tmp/dbmate
-            DATABASE_URL="postgres://postgres.$bref:$pw@$PREVIEW_PG_HOST:5432/postgres?sslmode=require" \
-              /tmp/dbmate -d /tmp/mw/db/migrations --no-dump-schema up \
-              || { echo "::error::$mwbr's migrations failed on the db branch"; exit 1; }
-          fi
-
-          # The preview's own queue-fed lambdas, on the ticket's PR image where it has one
-          pr_fns=""
-          for pair in evals:evaluator text_agent:text_agent livekit_dispatcher:livekit_dispatcher; do
-            lr=${pair%%:*}; base=${pair##*:}
-            n=$(gh pr list -R "$ORG/$lr" --state open --search "$TICKET in:title" --limit 5 --json number,headRefName,title \
-                  -q 'first(.[]|select((.headRefName+.title)|contains("--np")|not).number) // ""') || n=""
-            [ -n "$n" ] && aws lambda get-function --function-name "pr${n}_$base" >/dev/null 2>&1 || continue
-            kind=$base; [ "$base" = livekit_dispatcher ] && kind=dispatcher
-            pr_fns="$pr_fns $kind:pr${n}_$base"; echo "$lr: pr${n}_$base"
-          done
-          # the lambdas have to match the workers: same LiveKit key, same recordings bucket
-          lkv=$(.gating/bin/preview-secrets.sh dump "$LK_INFISICAL_PROJECT")
-          LK_API_KEY=$(jq -r '.LIVEKIT_API_KEY // empty' <<<"$lkv"); LK_API_SECRET=$(jq -r '.LIVEKIT_API_SECRET // empty' <<<"$lkv")
-          REC_BUCKET=$(jq -r '.TRANSCRIPT_S3_BUCKET_NAME // empty' <<<"$lkv")
-          echo "::add-mask::$LK_API_KEY"; echo "::add-mask::$LK_API_SECRET"
-          export LK_API_KEY LK_API_SECRET REC_BUCKET
-          PR_FUNCTIONS="$pr_fns" .gating/bin/preview-lambdas.sh up "$ENV_NAME" \
-            "postgres://postgres.$bref:$pw@$PREVIEW_PG_HOST:5432/postgres" "https://$bref.supabase.co" "$svckey" \
-            "https://middleware-$ENV_NAME.up.railway.app" >/dev/null \
-            || { echo "::error::could not build $ENV_NAME's lambdas"; exit 1; }
-
-          # Swap the base project's ref, password and keys for the branch's in every value that
-          # carries them. Secrets are rewritten in each service's Infisical folder for this
-          # preview; Railway only gets non-secret rewrites and the folder path.
-          mwp=$(tr ' ' '\n' <<<"$SERVICE_PROJECTS" | sed -n 's/^middleware://p')
-          base_pw=$(.gating/bin/preview-secrets.sh dump "$mwp" \
-                      | jq -r '.DATABASE_URL // empty' | python3 -c 'import sys,urllib.parse as u;print(u.urlparse(sys.stdin.read().strip()).password)')
-          base_keys=$(sb "$api/projects/$PREVIEW_DB_REF/api-keys?reveal=true")
-          base_anon=$(jq -r '.[]|select(.name=="anon").api_key' <<<"$base_keys"); base_svc=$(jq -r '.[]|select(.name=="service_role").api_key' <<<"$base_keys")
-          echo "::add-mask::$base_pw"; echo "::add-mask::$base_anon"; echo "::add-mask::$base_svc"
-          # an empty needle matches every value, which would copy every secret into the folder
-          [ -n "$base_pw" ] && [ -n "$base_anon" ] && [ -n "$base_svc" ] \
-            || { echo "::error::could not read the base db password or Supabase keys"; exit 1; }
-          swap='split($r)|join($br)|split($p)|join($bp)|split($a)|join($ba)|split($s)|join($bs)|split("preview-base-")|join($e)'
-          jqargs=(--arg r "$PREVIEW_DB_REF" --arg br "$bref" --arg p "$base_pw" --arg bp "$pw"
-                  --arg a "$base_anon" --arg ba "$anon" --arg s "$base_svc" --arg bs "$svckey" --arg e "$ENV_NAME-")
-          for sp in $SERVICE_PROJECTS; do
-            svc=${sp%%:*}; proj=${sp##*:}
-            .gating/bin/preview-secrets.sh dump "$proj" | jq -c "${jqargs[@]}" \
-              "with_entries(select(.value|tostring|(contains(\$r) or contains(\$p) or contains(\$a) or contains(\$s) or contains(\"preview-base-\")))
-                            | .value |= (tostring|$swap))" \
-              | .gating/bin/preview-secrets.sh put "$proj" "${ENV_NAME#preview-}" \
-              || { echo "::error::could not write $svc's preview secrets to Infisical"; exit 1; }
-            args+=(--service-config "$svc" variables.INFISICAL_SECRET_PATH.value "/previews/${ENV_NAME#preview-}")
-          done
-          for entry in $RAILWAY_REPOS; do
-            svc=${entry##*:}
-            vars=$(railway variables -s "$svc" -e "$BASE_ENV" --json)
-            # fail closed: a secret on Railway would be copied into the preview in plain text
-            leak=$(jq -r "${jqargs[@]}" 'to_entries[] | select(.value|tostring|((contains($p) and ($p|length)>0) or contains($a) or contains($s))) | .key' <<<"$vars")
-            [ -z "$leak" ] || { echo "::error::$svc has secrets on Railway ($(tr '\n' ' ' <<<"$leak")); move them to Infisical"; exit 1; }
-            while IFS=$'\t' read -r k v; do
-              args+=(--service-config "$svc" "variables.$k.value" "$(base64 -d <<<"$v")")
-            done < <(jq -r "${jqargs[@]}" "to_entries[] | select(.key|startswith(\"RAILWAY_\")|not)
-                       | select(.value|tostring|(contains(\$r) or contains(\"preview-base-\")))
-                       | [.key, (.value|tostring|$swap|@base64)] | @tsv" <<<"$vars")
-          done
-
-          # Recreate rather than patch: one command sets every branch atomically, and a
-          # preview is disposable so there is nothing worth preserving across a refresh.
-          railway environment delete "$ENV_NAME" --yes >/dev/null 2>&1 || true
-          # delete frees the name asynchronously and `environment list` stops showing it
-          # before it is actually free, so polling the list is not a usable signal. Retry
-          # the create instead: losing this race leaves the ticket with NO environment,
-          # because the delete already succeeded.
-          # Two transient failures land here: the name not yet free, and the workspace cap
-          # of one environment per 30 seconds. Retry on anything, since by this point the
-          # delete has already happened and giving up leaves the ticket with nothing.
-          # Budget has to outlast the cap times the number of repos on the ticket: seven
-          # repos pushing together need over 200s, and 20x6 gave up at 120. The jitter
-          # stops the callers re-colliding on the same 30s boundary every round.
-          created=0 err=""
-          for _ in $(seq 1 30); do
-            if err=$(railway environment new "$ENV_NAME" --duplicate "$BASE_ENV" "${args[@]}" 2>&1); then
-              created=1; break
-            fi
-            sleep $(( 12 + RANDOM % 9 ))
-          done
-          [ "$created" = 1 ] \
-            || { echo "::error::could not create $ENV_NAME: $(tail -2 <<<"$err")"; exit 1; }
-
-
-          # a duplicated environment gets its domain a beat after it exists, and reading
-          # in that gap returns nothing, which silently costs the PR its comment.
-          url=""
-          for _ in $(seq 1 30); do
-            # `|| url=""`, not a bare assignment: under -e plus pipefail a failing
-            # `domain list` kills the step outright, which is what the retry is for.
-            url=$(railway domain list --service frontend --environment "$ENV_NAME" --json 2>/dev/null \
-                  | jq -r 'first(.domains[].domain) // ""') || url=""
-            [ -n "$url" ] && break
-            sleep 2
-          done
-          [ -n "$url" ] || echo "::warning::no frontend domain on $ENV_NAME after 60s"
-          [ -z "$url" ] || url="https://$url"
-          # Railway serves "the train has not arrived at the station" until the service
-          # deploys, and Next takes minutes. A link posted before then looks broken, so
-          # wait for it, and say so in the comment when it is still going.
-          ready=0
-          if [ -n "$url" ]; then
-            for _ in $(seq 1 60); do
-              code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || echo 000)
-              case "$code" in 200|3??|401|403) ready=1; break ;; esac
-              sleep 10
-            done
-            [ "$ready" = 1 ] && echo "frontend serving ($code)" || echo "::warning::frontend still building after 10 min"
-          fi
-          echo "ready=$ready" >> "$GITHUB_OUTPUT"
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "touched=$touched" >> "$GITHUB_OUTPUT"
-          echo "preview: $url"
-
-      - name: Post the one link on every PR of the ticket, and on Linear
-        if: steps.t.outputs.skip != '1' && steps.t.outputs.want == '1' && steps.up.outputs.url != ''
-        env:
-          GH_TOKEN: ${{ secrets.PREVIEW_GH_TOKEN }}
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          TICKET: ${{ steps.t.outputs.ticket }}
-          URL: ${{ steps.up.outputs.url }}
-          TOUCHED: ${{ steps.up.outputs.touched }}
-          READY: ${{ steps.up.outputs.ready }}
-        run: |
-          set -uo pipefail
-          body=":rocket: **Preview for $TICKET** · $URL"
-          [ "$READY" = 1 ] || body="$body"$'\n\n'":hourglass: Still building, give it a few minutes."
-          body="$body"$'\n\n'"Every PR on this ticket is in it. Repos the ticket does not touch run \`main\`."
-          body="$body"$'\n'"Changed here:$TOUCHED. Data is the shared sandbox, not production."
-          body="$body"$'\n'"It is rebuilt on every push and torn down when the ticket's last PR closes."
-
-          # One comment per PR, replacing our own previous one so pushes do not pile up.
-          for entry in $RAILWAY_REPOS $LAMBDA_REPOS; do
-            r=${entry%%:*}
-            for n in $(gh pr list -R "$ORG/$r" --state open --search "$TICKET in:title" --limit 10 --json number -q '.[].number'); do
-              old=$(gh api "repos/$ORG/$r/issues/$n/comments" \
-                    -q "first(.[] | select(.body | startswith(\":rocket: **Preview for\")) | .id) // \"\"" 2>/dev/null)
-              [ -n "$old" ] && gh api -X DELETE "repos/$ORG/$r/issues/comments/$old" >/dev/null 2>&1
-              gh pr comment "$n" -R "$ORG/$r" --body "$body" >/dev/null 2>&1 && echo "commented $r#$n"
-            done
-          done
-
-          [ -n "${LINEAR_API_KEY:-}" ] || { echo "no LINEAR_API_KEY, skipping the Linear link"; exit 0; }
-          # attachmentCreate is idempotent on url, so a rebuild updates rather than duplicates.
-          q='mutation($i:String!,$u:String!,$t:String!){attachmentCreate(input:{issueId:$i,url:$u,title:$t}){success}}'
-          resp=$(curl -fsS --max-time 20 https://api.linear.app/graphql \
-            -H "Authorization: $LINEAR_API_KEY" -H 'content-type: application/json' \
-            -d "$(jq -nc --arg q "$q" --arg i "$TICKET" --arg u "$URL" --arg t "Preview" \
-                  '{query:$q,variables:{i:$i,u:$u,t:$t}}')" 2>/dev/null)
-          if grep -q '"success":true' <<<"${resp:-}"; then echo "attached to $TICKET"
-          else echo "::warning::could not attach the preview to $TICKET: ${resp:0:160}"; fi
+          payload=$(jq -nc --arg repo "$REPO" --arg pr "$PR" --arg action "$ACTION" --arg ticket "$ticket" \
+            '{event_type:"preview-ticket",client_payload:{repo:$repo,pr:$pr,action:$action,ticket:$ticket}}')
+          curl -fsS --max-time 20 -X POST \
+            https://api.github.com/repos/bluejay-ai-dev/bluejay-github-actions/dispatches \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H 'Content-Type: application/json' \
+            -d "$payload" >/dev/null
+          echo "queued $ticket preview work in bluejay-github-actions"
