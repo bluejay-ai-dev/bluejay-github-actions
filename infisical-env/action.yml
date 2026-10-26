@@ -1,0 +1,75 @@
+name: 'Infisical env'
+description: 'Load an allowlist of secrets from Infisical into the job environment over GitHub OIDC. The job needs permissions id-token: write.'
+
+inputs:
+  project_id:
+    description: 'Infisical project id (not the slug)'
+    required: true
+  identity_id:
+    description: 'Infisical machine identity id with OIDC auth for this repo'
+    required: true
+  environment:
+    description: 'Infisical environment slug'
+    required: false
+    default: 'local'
+  keys:
+    description: 'Secret names to load, separated by spaces or newlines'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Load secrets from Infisical
+      shell: bash
+      env:
+        INFISICAL_PROJECT_ID: ${{ inputs.project_id }}
+        INFISICAL_IDENTITY_ID: ${{ inputs.identity_id }}
+        INFISICAL_ENV: ${{ inputs.environment }}
+        INFISICAL_KEYS: ${{ inputs.keys }}
+      run: |
+        set -f
+        if [ -z "$INFISICAL_PROJECT_ID" ] || [ -z "$INFISICAL_IDENTITY_ID" ] || [ -z "$INFISICAL_ENV" ] || [ -z "${INFISICAL_KEYS//[[:space:]]/}" ]; then
+          echo "::error::project_id, identity_id, environment and keys are all required"
+          exit 2
+        fi
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+          echo "::error::no OIDC token; the job needs permissions id-token: write"
+          exit 2
+        fi
+        for key in $INFISICAL_KEYS; do
+          if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then echo "::error::bad key name: $key"; exit 2; fi
+        done
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64) arch=amd64; sha=c1c1be0d4f967f4c1b9f1b02401fb4a54aa5174cdfb18bb7d6dd8f742efc1648 ;;
+          Linux/aarch64 | Linux/arm64) arch=arm64; sha=661b1b8108ca08cd7c5a644cad9ddb4946145142ef392cfc88955bcbac82165c ;;
+          *) echo "::error::unsupported runner $(uname -s)/$(uname -m); only Linux x86_64 and arm64"; exit 2 ;;
+        esac
+        dir="$RUNNER_TEMP/infisical-0.44.8-$arch"
+        infisical="$dir/infisical"
+        if [ ! -x "$infisical" ]; then
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/cli.tar.gz" "https://github.com/Infisical/cli/releases/download/v0.44.8/cli_0.44.8_linux_$arch.tar.gz"
+          echo "$sha  $dir/cli.tar.gz" | sha256sum -c -
+          tar -xzf "$dir/cli.tar.gz" -C "$dir" infisical
+          rm "$dir/cli.tar.gz"
+        fi
+        jwt=$(curl -fsSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=infisical" | jq -er .value)
+        echo "::add-mask::$jwt"
+        token=$("$infisical" login --method=oidc-auth --machine-identity-id="$INFISICAL_IDENTITY_ID" --jwt="$jwt" --plain --silent)
+        echo "::add-mask::$token"
+        secrets=$("$infisical" export --env="$INFISICAL_ENV" --format=json --projectId="$INFISICAL_PROJECT_ID" --token="$token" --silent)
+        for key in $INFISICAL_KEYS; do
+          if ! value=$(jq -je --arg k "$key" 'map(select(.key == $k))[0].value' <<<"$secrets" && printf x); then
+            echo "::error::$key is not in Infisical env $INFISICAL_ENV"
+            exit 1
+          fi
+          value=${value%x}
+          if [[ "$value" == *[![:space:]]* ]]; then
+            escaped=${value//%/%25}
+            escaped=${escaped//$'\r'/%0D}
+            escaped=${escaped//$'\n'/%0A}
+            echo "::add-mask::$escaped"
+          fi
+          delimiter="EOF_$(openssl rand -hex 16)"
+          printf '%s<<%s\n%s\n%s\n' "$key" "$delimiter" "$value" "$delimiter" >> "$GITHUB_ENV"
+        done
