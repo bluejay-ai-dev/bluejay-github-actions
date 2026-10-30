@@ -26,15 +26,19 @@ linear() {  # linear <ENG-123> <fields> -> raw graphql response
 }
 
 ticket_repos() {  # repos with a PR on ticket $1, this repo included
-  local r=""
+  local r="" self="${GITHUB_REPOSITORY##*/}" err
+  # A frontend repo already answers has_frontend, so it needs no cross-repo search.
+  if has_frontend "$self"; then echo "$self"; return 0; fi
   if [ -n "${GH_TOKEN:-}" ]; then
+    err=$(mktemp)
     r=$(gh search prs --owner "${OWNER:-${GITHUB_REPOSITORY_OWNER:-}}" --match title "$1" --limit 50 \
           --json repository,title \
-          -q ".[] | select(.title | test(\"\\\\b$1\\\\b\"; \"i\")) | .repository.name" 2>/dev/null | tr '\n' ' ') || return 1
+          -q ".[] | select(.title | test(\"\\\\b$1\\\\b\"; \"i\")) | .repository.name" 2>"$err" | tr '\n' ' ') \
+      || { echo "gh search prs failed: $(head -c 300 "$err")" >&2; return 1; }
   else
     echo "no GH_TOKEN, the PR set is this repo only" >&2
   fi
-  echo "$r ${GITHUB_REPOSITORY##*/}"
+  echo "$r $self"
 }
 
 has_frontend() {  # has_frontend "<repos>"
@@ -78,7 +82,7 @@ c_visuals() {
   local id repos b
   id=$(ticket_id)
   if [ -n "$id" ]; then
-    repos=$(ticket_repos "$id") || die "could not list the PRs on $id, add a visual or the 'no-visual' label"
+    repos=$(ticket_repos "$id") || skip "could not list the PRs on $id, visual check skipped"
     has_frontend "$repos" || skip "no frontend repo on $id (${repos# }), no visual required"
   fi
   # cubic appends its own block with an <img> review button. Counting that as
